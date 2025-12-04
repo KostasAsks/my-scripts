@@ -1,0 +1,1136 @@
+// ==UserScript==
+// @name         Zeus V3 Flow & Reaction Master
+// @namespace    http://tampermonkey.net/
+// @version      2.2
+// @description  Combined Actor Tree (Actions) & Trigger Categories - Alt+8
+// @author       Debug Helper
+// @match        http://localhost:*/*
+// @match        https://localhost:*/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    let tracerWindow = null;
+    let isPaused = false;
+    const hookedActors = new Set();
+    let isInitialized = false;
+    let detectedGameName = '';
+
+    // Data structures
+    const actorData = new Map();        // actor name -> { lastAction, lastTime, totalCalls, pixiContainer }
+    const actorHistory = new Map();     // actor name -> { actions: [], triggers: [] }
+    const triggerData = new Map();      // trigger name -> { count, actors: Set, receivers, state, lastTime, category }
+    
+    const actionFlow = [];
+    const triggerFlow = [];
+    const MAX_FLOW = 100;
+
+    // UI State
+    let currentMode = 'actions';        // 'actions' or 'triggers'
+    let currentView = 'split';          // 'split' or 'timeline'
+    let selectedActor = null;
+    let selectedTrigger = null;
+    
+    let expandedFolders = new Set(['actors']);
+    let expandedTriggerCats = new Set(['Reels', 'Mini Games']);
+    let expandedReceiverSections = new Set(['reels', 'symbols', 'other']);
+
+    let highlightedActorName = null;
+    let highlightOverlay = null;
+    let pixiApp = null;
+    let cachedReelBounds = null;
+    let reelBoundsCacheTime = 0;
+
+    // Configuration
+    const TRIGGER_SOURCES = {
+        'BeforeReelCellAttachSymbol': 'ActorTriggers.Reels',
+        'AfterReelCellAttachSymbol': 'ActorTriggers.Reels',
+        'BeforeReelCellDetachSymbol': 'ActorTriggers.Reels',
+        'SetReelSpinState': 'ActorTriggers.Reels',
+        'OnReelStopSpinning': 'ActorTriggers.Reels',
+        'OnReelStartSpinning': 'ActorTriggers.Reels',
+        'OnFirstReelStartSpinning': 'ActorTriggers.Reels',
+        'OnAllReelsStopSpinning': 'ActorTriggers.Reels',
+        'OnAllReelsStartSpinning': 'ActorTriggers.Reels',
+        'OnWinningsPresentationStart': 'ActorTriggers.Reels',
+        'OnWinningsPresentation': 'ActorTriggers.Reels',
+        'OnWinningsPresentationEnd': 'ActorTriggers.Reels',
+        'OnIdle': 'ActorTriggers.MiniGames',
+        'OnReceiveServerPlayGameResponse': 'ActorTriggers.MiniGames',
+        'OnTransitionCurrentMiniGameToFutureMiniGame': 'ActorTriggers.MiniGames',
+        'AddedToActorAsChild': 'ActorTriggers.Actors',
+        'RemovedFromParentActor': 'ActorTriggers.Actors',
+    };
+
+    const TRIGGER_CATEGORIES = {
+        'Reels': { icon: '🎰', color: '#a78bfa', match: s => /reel|spin|stop/i.test(s) },
+        'Symbols': { icon: '💎', color: '#f472b6', match: s => /symbol|attach|detach/i.test(s) },
+        'Wins': { icon: '🏆', color: '#34d399', match: s => /win|counter|presentation/i.test(s) },
+        'Mini Games': { icon: '🎮', color: '#f87171', match: s => /mini|game|transition|idle/i.test(s) },
+        'Actors': { icon: '🎭', color: '#c084fc', match: s => /actor|added|child|parent/i.test(s) },
+        'Other': { icon: '📦', color: '#94a3b8', match: () => true }
+    };
+
+    // ===== Helpers =====
+    function detectGameName() {
+        if (detectedGameName) return detectedGameName;
+        const path = window.location.pathname;
+        let match = path.match(/games\/([^/]+)/);
+        if (match) { detectedGameName = match[1]; return detectedGameName; }
+        return 'game';
+    }
+
+    function getPixiApp() {
+        if (pixiApp) return pixiApp;
+        if (window.__PIXI_APP__) { pixiApp = window.__PIXI_APP__; return pixiApp; }
+        if (window.ZeusPlay?.pixiApp) { pixiApp = window.ZeusPlay.pixiApp; return pixiApp; }
+        return null;
+    }
+
+    function getTriggerCategory(name) {
+        for (const [cat, cfg] of Object.entries(TRIGGER_CATEGORIES)) {
+            if (cfg.match(name)) return cat;
+        }
+        return 'Other';
+    }
+
+    function getTriggerSource(name) {
+        if (TRIGGER_SOURCES[name]) return TRIGGER_SOURCES[name];
+        if (name.toLowerCase().includes('custom')) return 'GameCustomTriggers';
+        return 'Unknown';
+    }
+
+    // ===== Path & Tree Logic =====
+    function getActorPathInfo(actorName) {
+        const baseName = actorName.replace(/\[\d+\]$/, '').replace(/^actor-/, '');
+        const gameName = detectGameName();
+        let pathSegments = [];
+        let fileName = '';
+
+        const patterns = [
+            { match: /^symbols-coins-and-collectors-collecting-effect-backgrounds$/, segments: ['symbols', 'coins-and-collectors'], file: 'collecting-effect-backgrounds-actor.ts' },
+            { match: /^symbols-coins-glow-effect-backgrounds$/, segments: ['symbols', 'coins'], file: 'glow-effect-backgrounds-actor.ts' },
+            { match: /^symbols-(.+)$/, segments: ['symbols'], file: 'symbol-{1}-actor.ts' },
+            { match: /^coins$/, segments: ['coins', 'collectable'], file: 'coins-actor.ts' },
+            { match: /^coins-for-logo$/, segments: ['coins'], file: 'coins-for-logo-actor.ts' },
+            { match: /^coins-particles$/, segments: [], file: 'coins-particles-actor.ts' },
+            { match: /^collectors$/, segments: ['coins', 'collectors'], file: 'collectors-actor.ts' },
+            { match: /^stickies$/, segments: ['stickies'], file: 'stickies-actor.ts' },
+            { match: /^sticky$/, segments: ['stickies', 'sticky'], file: 'sticky-actor.ts' },
+            { match: /^game-scene-frame$/, segments: ['game-scene'], file: 'game-scene-frame-actor.ts' },
+            { match: /^game-scene-background$/, segments: ['game-scene'], file: 'game-scene-background-actor.ts' },
+            { match: /^game-scene-coins$/, segments: ['game-scene'], file: 'game-scene-coins-actor.ts' },
+            { match: /^game-scene-(.+)$/, segments: ['game-scene'], file: 'game-scene-{1}-actor.ts' },
+            { match: /^game-scene$/, segments: ['game-scene'], file: 'game-scene-actor.ts' },
+            { match: /^splash-screen-(.+)$/, segments: ['splash-screen'], file: 'splash-screen-{1}-actor.ts' },
+            { match: /^splash-screen$/, segments: ['splash-screen'], file: 'splash-screen-actor.ts' },
+            { match: /^win-animations-(.+)$/, segments: ['win-animations'], file: 'win-animations-{1}-actor.ts' },
+            { match: /^win-animations$/, segments: ['win-animations'], file: 'win-animations-actor.ts' },
+            { match: /^win-counter$/, segments: ['win-counter'], file: 'win-counter-actor.ts' },
+            { match: /^logo$/, segments: ['logo'], file: 'logo-actor.ts' },
+            { match: /^background-(.+)$/, segments: ['background'], file: 'background-{1}-actor.ts' },
+            { match: /^background$/, segments: ['background'], file: 'background-actor.ts' },
+            { match: /^particles-(.+)$/, segments: ['particles'], file: 'particles-{1}-actor.ts' },
+            { match: /^pay-lines$/, segments: ['pay-lines'], file: 'pay-lines-actor.ts' },
+            { match: /^postpone-(.+)$/, segments: ['postpone'], file: 'postpone-{1}-actor.ts' },
+            { match: /^postpone$/, segments: ['postpone'], file: 'postpone-actor.ts' },
+            { match: /^dialog-box$/, segments: ['dialog-box'], file: 'dialog-box-actor.ts' },
+            { match: /^live-paytable$/, segments: [], file: 'live-paytable-actor.ts' },
+            { match: /^back$/, segments: [], file: 'back-actor.ts' },
+            { match: /^front$/, segments: [], file: 'front-actor.ts' },
+            { match: /^middle$/, segments: [], file: 'middle-actor.ts' },
+            { match: /^(.+)$/, segments: [], file: '{1}-actor.ts' },
+        ];
+
+        for (const p of patterns) {
+            const m = baseName.match(p.match);
+            if (m) {
+                pathSegments = [...p.segments];
+                fileName = p.file;
+                if (m[1]) fileName = fileName.replace('{1}', m[1]);
+                break;
+            }
+        }
+        if (!fileName) fileName = baseName + '.ts';
+
+        const fullSegments = [gameName, 'src', 'actors', ...pathSegments];
+        const fullPath = 'games/' + fullSegments.join('/') + '/' + fileName;
+        return { gameName, segments: fullSegments, fileName, fullPath };
+    }
+
+    function generatePathTreeHTML(pathInfo) {
+        const { segments, fileName } = pathInfo;
+        let html = '<div class="path-tree">';
+        html += '<div class="tree-row"><span class="tree-icon">📦</span><span class="folder-name">games</span></div>';
+        segments.forEach((seg, idx) => {
+            const indent = (idx + 1) * 18;
+            let icon = '📁';
+            if (seg === 'src') icon = '💻';
+            else if (seg === 'actors') icon = '🎭';
+            html += '<div class="tree-row" style="padding-left:' + indent + 'px;">';
+            html += '<span class="tree-branch">└</span>';
+            html += '<span class="tree-icon">' + icon + '</span>';
+            html += '<span class="folder-name">' + seg + '</span>';
+            html += '</div>';
+        });
+        if (fileName) {
+            const indent = (segments.length + 1) * 18;
+            html += '<div class="tree-row file-highlight" style="padding-left:' + indent + 'px;">';
+            html += '<span class="tree-branch">└</span>';
+            html += '<span class="tree-icon">📄</span>';
+            html += '<span class="file-name">' + fileName + '</span>';
+            html += '</div>';
+        }
+        html += '</div>';
+        return html;
+    }
+
+    function buildActorTree() {
+        const tree = { name: 'actors', type: 'folder', children: {}, actors: [] };
+
+        actorData.forEach((data, actorName) => {
+            const cleanName = actorName.replace(/^actor-/, '').replace(/\[\d+\]$/, '');
+            let folder = 'other';
+            
+            const folderMappings = [
+                { match: /^(game-scene)/, folder: 'game-scene' },
+                { match: /^(symbols)/, folder: 'symbols' },
+                { match: /^(coins|collectors)/, folder: 'coins' },
+                { match: /^(stickies|sticky)/, folder: 'stickies' },
+                { match: /^(win-animations|win-counter)/, folder: 'win' },
+                { match: /^(splash-screen)/, folder: 'splash-screen' },
+                { match: /^(logo)/, folder: 'logo' },
+                { match: /^(background)/, folder: 'background' },
+                { match: /^(particles)/, folder: 'particles' },
+                { match: /^(dialog)/, folder: 'dialog-box' },
+                { match: /^(pay-lines)/, folder: 'pay-lines' },
+                { match: /^(postpone)/, folder: 'postpone' },
+                { match: /^(back|front|middle)$/, folder: 'core' },
+                { match: /^(live-paytable)/, folder: 'core' },
+            ];
+
+            for (const mapping of folderMappings) {
+                if (mapping.match.test(cleanName)) { folder = mapping.folder; break; }
+            }
+
+            if (!tree.children[folder]) {
+                tree.children[folder] = { name: folder, type: 'folder', children: {}, actors: [] };
+            }
+
+            const vis = getActorVisibility(actorName);
+            tree.children[folder].actors.push({
+                name: actorName,
+                displayName: cleanName,
+                data: data,
+                onScreen: vis.inArea,
+                parentCell: vis.parentCell
+            });
+        });
+
+        Object.values(tree.children).forEach(folder => {
+            folder.actors.sort((a, b) => b.data.lastTime - a.data.lastTime);
+        });
+
+        return tree;
+    }
+
+    // ===== Visibility & Grid =====
+    function findActorInRegistry(name) {
+        const registry = window.ZeusPlay?.actors?.actorsRegistry;
+        if (!registry) return null;
+        const match = name.match(/^([^\[]+)(\[(\d+)\])?$/);
+        if (!match) return null;
+        const baseName = match[1], index = match[3] !== undefined ? parseInt(match[3]) : 0;
+        const store = registry.get(baseName);
+        if (!store) return null;
+        return (store._actors || store.actors || [])[index] || null;
+    }
+
+    function getReelAreaBounds() {
+        const now = Date.now();
+        if (cachedReelBounds && now - reelBoundsCacheTime < 500) return cachedReelBounds;
+        const app = getPixiApp();
+        if (!app?.stage) return null;
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        function findCells(node) {
+            if (!node.worldVisible) return;
+            const label = node.label || node.name || '';
+            if (/^Cell-\d+-\d+-\d+$/i.test(label)) {
+                try {
+                    const bounds = node.getBounds();
+                    if (bounds && bounds.width > 0) {
+                        minX = Math.min(minX, bounds.x); minY = Math.min(minY, bounds.y);
+                        maxX = Math.max(maxX, bounds.x + bounds.width); maxY = Math.max(maxY, bounds.y + bounds.height);
+                    }
+                } catch (e) {}
+            }
+            if (node.children) for (const child of node.children) findCells(child);
+        }
+        findCells(app.stage);
+        if (minX === Infinity) return null;
+        cachedReelBounds = { x: minX - 20, y: minY - 20, right: maxX + 20, bottom: maxY + 20 };
+        reelBoundsCacheTime = now;
+        return cachedReelBounds;
+    }
+
+    function getActorBounds(actor) {
+        const obj = actor?.graphicContainer?.graphic || actor;
+        if (!obj || typeof obj.getBounds !== 'function') return null;
+        try { const b = obj.getBounds(); if (b && (b.width > 0 || b.height > 0)) return b; } catch (e) {}
+        return null;
+    }
+
+    function isInReelArea(bounds) {
+        const rb = getReelAreaBounds();
+        if (!rb || !bounds) return false;
+        const cx = bounds.x + bounds.width / 2, cy = bounds.y + bounds.height / 2;
+        return cx >= rb.x && cx <= rb.right && cy >= rb.y && cy <= rb.bottom;
+    }
+
+    function findParentCellLabel(actor) {
+        if (!actor) return null;
+        let current = actor.graphicContainer?.graphic || actor, depth = 0;
+        while (current && depth < 20) {
+            const label = current.label || current.name || '';
+            if (/^Cell-\d+-\d+-\d+$/i.test(label)) return label;
+            current = current.parent; depth++;
+        }
+        return null;
+    }
+
+    function getActorVisibility(name) {
+        const actor = findActorInRegistry(name);
+        if (!actor) return { found: false, inArea: false, parentCell: null };
+        const obj = actor.graphicContainer?.graphic || actor;
+        if (!obj) return { found: true, inArea: false, parentCell: null };
+        const worldVisible = obj.worldVisible ?? obj.visible ?? true;
+        if (!worldVisible) return { found: true, inArea: false, parentCell: null };
+        const bounds = getActorBounds(actor);
+        const parentCell = findParentCellLabel(actor);
+        return { found: true, inArea: bounds ? isInReelArea(bounds) : false, parentCell };
+    }
+
+    function parseCellLabel(label) {
+        if (!label) return null;
+        const m = label.match(/^Cell-(\d+)-(\d+)-(\d+)$/i);
+        return m ? { mg: parseInt(m[1]), reel: parseInt(m[2]), cell: parseInt(m[3]) } : null;
+    }
+
+    // ===== Highlight =====
+    function createHighlightOverlay() {
+        if (highlightOverlay) return highlightOverlay;
+        const div = document.createElement('div');
+        div.id = '__master_highlight__';
+        Object.assign(div.style, {
+            position: 'fixed', border: '3px solid #a855f7',
+            background: 'rgba(168, 85, 247, 0.2)',
+            boxShadow: '0 0 20px rgba(168,85,247,0.5)',
+            pointerEvents: 'none', zIndex: '2147483645',
+            display: 'none', borderRadius: '8px',
+        });
+        const label = document.createElement('div');
+        Object.assign(label.style, {
+            position: 'absolute', bottom: '100%', left: '-3px',
+            background: 'linear-gradient(135deg, #a855f7, #7c3aed)', color: '#fff',
+            padding: '4px 10px', fontSize: '11px',
+            fontWeight: 'bold', whiteSpace: 'nowrap', borderRadius: '4px 4px 0 0'
+        });
+        div.appendChild(label);
+        document.body.appendChild(div);
+        highlightOverlay = div;
+        return div;
+    }
+
+    function clearHighlight() {
+        if (highlightOverlay) highlightOverlay.style.display = 'none';
+        highlightedActorName = null;
+    }
+
+    function highlightActor(name) {
+        const actor = findActorInRegistry(name);
+        if (!actor) { clearHighlight(); return false; }
+        highlightedActorName = name;
+        const bounds = getActorBounds(actor);
+        if (!bounds) { clearHighlight(); return false; }
+        const canvas = document.querySelector('canvas');
+        if (!canvas) { clearHighlight(); return false; }
+        const rect = canvas.getBoundingClientRect(), app = getPixiApp();
+        const sx = rect.width / (app?.renderer?.width || canvas.width);
+        const sy = rect.height / (app?.renderer?.height || canvas.height);
+        const overlay = createHighlightOverlay();
+        Object.assign(overlay.style, {
+            left: (rect.left + bounds.x * sx) + 'px',
+            top: (rect.top + bounds.y * sy) + 'px',
+            width: (bounds.width * sx) + 'px',
+            height: (bounds.height * sy) + 'px',
+            display: 'block'
+        });
+        overlay.querySelector('div').textContent = name;
+        return true;
+    }
+
+    // ===== Logging =====
+    function logAction(actorName, action, params, pixiContainer) {
+        if (isPaused) return;
+        const now = Date.now();
+        
+        const existing = actorData.get(actorName);
+        actorData.set(actorName, {
+            lastAction: action,
+            lastTime: now,
+            totalCalls: (existing?.totalCalls || 0) + 1,
+            pixiContainer: pixiContainer || existing?.pixiContainer
+        });
+
+        if (!actorHistory.has(actorName)) actorHistory.set(actorName, { actions: [], triggers: [] });
+        const hist = actorHistory.get(actorName);
+        const existingIdx = hist.actions.findIndex(a => a.name === action);
+        if (existingIdx >= 0) {
+            const old = hist.actions.splice(existingIdx, 1)[0];
+            hist.actions.unshift({ name: action, count: old.count + 1, time: now, params });
+        } else {
+            hist.actions.unshift({ name: action, count: 1, time: now, params });
+        }
+        if (hist.actions.length > 30) hist.actions.length = 30;
+
+        actionFlow.unshift({ actor: actorName, action, time: now, params });
+        if (actionFlow.length > MAX_FLOW) actionFlow.length = MAX_FLOW;
+
+        if (tracerWindow && !tracerWindow.closed) render();
+    }
+
+    function logTrigger(name, state, sender, receivers) {
+        if (isPaused) return;
+        const now = Date.now();
+
+        if (!triggerData.has(name)) {
+            triggerData.set(name, { count: 0, actors: new Set(), receivers: [], state: {}, lastTime: 0, category: getTriggerCategory(name) });
+        }
+        const data = triggerData.get(name);
+        data.count++;
+        data.actors.add(sender);
+        data.receivers = receivers;
+        data.state = state;
+        data.lastTime = now;
+
+        if (!actorHistory.has(sender)) actorHistory.set(sender, { actions: [], triggers: [] });
+        const hist = actorHistory.get(sender);
+        hist.triggers.unshift({ name, count: 1, time: now });
+        if (hist.triggers.length > 30) hist.triggers.length = 30;
+
+        triggerFlow.unshift({ name, sender, receivers, state, time: now });
+        if (triggerFlow.length > MAX_FLOW) triggerFlow.length = MAX_FLOW;
+
+        if (tracerWindow && !tracerWindow.closed) render();
+    }
+
+    // ===== Hooking =====
+    function hookActor(actor, actorName) {
+        if (!actor || hookedActors.has(actor)) return false;
+
+        if (typeof actor.callAction === 'function') {
+            const original = actor.callAction.bind(actor);
+            const pixiContainer = actor.graphicContainer?.graphic || actor.getContainer?.() || actor.container || null;
+            actor.callAction = function(action, params) {
+                const actionStr = typeof action === 'object' ? (action.type || JSON.stringify(action)) : String(action);
+                logAction(actorName, actionStr, params, pixiContainer);
+                return original(action, params);
+            };
+        }
+
+        if (typeof actor.exposeTrigger === 'function') {
+            const original = actor.exposeTrigger.bind(actor);
+            actor.exposeTrigger = function(trigger) {
+                const name = trigger?.triggerName || trigger?.constructor?.triggerName || trigger?.name || 'unknown';
+                const state = trigger?.state || {};
+                const registry = window.ZeusPlay?.actors?.actorsRegistry;
+                const receivers = [];
+                if (registry) {
+                    registry.forEach((store, n) => {
+                        (store._actors || store.actors || []).forEach((a, i) => {
+                            if (a !== actor) receivers.push((store._actors || store.actors).length > 1 ? n + '[' + i + ']' : n);
+                        });
+                    });
+                }
+                logTrigger(name, state, actorName, receivers.slice(0, 200));
+                return original(trigger);
+            };
+        }
+
+        hookedActors.add(actor);
+        return true;
+    }
+
+    function hookAllActors() {
+        const registry = window.ZeusPlay?.actors?.actorsRegistry;
+        if (!registry) return;
+        registry.forEach((store, name) => {
+            const actors = store._actors || store.actors || [];
+            actors.forEach((actor, idx) => {
+                const actorName = actors.length > 1 ? name + '[' + idx + ']' : name;
+                hookActor(actor, actorName);
+            });
+        });
+    }
+
+    // ===== Rendering =====
+    function render() {
+        if (!tracerWindow || tracerWindow.closed) return;
+        
+        // Update Mode Attribute for CSS Styling
+        tracerWindow.document.body.dataset.mode = currentMode;
+
+        if (currentView === 'timeline') {
+            renderTimeline();
+        } else {
+            if (currentMode === 'actions') renderActorTree();
+            else renderTriggerCategories();
+            
+            renderDetailPanel();
+        }
+    }
+
+    function renderActorTree() {
+        const doc = tracerWindow.document;
+        const container = doc.getElementById('leftContent');
+        const search = doc.getElementById('search').value.toLowerCase();
+        
+        const tree = buildActorTree();
+        const folders = Object.values(tree.children)
+            .filter(f => f.actors.length > 0)
+            .filter(f => !search || f.actors.some(a => a.name.toLowerCase().includes(search)))
+            .sort((a, b) => {
+                const aMax = Math.max(...a.actors.map(x => x.data.lastTime));
+                const bMax = Math.max(...b.actors.map(x => x.data.lastTime));
+                return bMax - aMax;
+            });
+
+        doc.getElementById('catCount').textContent = folders.reduce((s, f) => s + f.actors.length, 0);
+
+        let html = '';
+        const folderIcons = {
+            'game-scene': '🎮', 'symbols': '💎', 'coins': '🪙', 'stickies': '📌',
+            'win': '🏆', 'splash-screen': '🎬', 'logo': '🏷️', 'background': '🖼️',
+            'particles': '✨', 'dialog-box': '💬', 'pay-lines': '📊', 'postpone': '⏸️',
+            'core': '⚙️', 'collectors': '🧲', 'other': '📁'
+        };
+
+        folders.forEach(folder => {
+            const isExpanded = expandedFolders.has(folder.name);
+            const folderActors = search ? folder.actors.filter(a => a.name.toLowerCase().includes(search)) : folder.actors;
+            
+            html += '<div class="tree-folder ' + (isExpanded ? 'expanded' : '') + '" data-folder="' + folder.name + '">';
+            html += '<div class="tree-folder-header">';
+            html += '<span class="tree-chevron">▶</span>';
+            html += '<span class="tree-folder-icon">' + (folderIcons[folder.name] || '📁') + '</span>';
+            html += '<span class="tree-folder-name">' + folder.name + '</span>';
+            html += '<span class="tree-folder-badge">' + folderActors.length + '</span>';
+            html += '</div><div class="tree-folder-children">';
+
+            folderActors.forEach(actor => {
+                const isSel = selectedActor === actor.name;
+                const isRecent = Date.now() - actor.data.lastTime < 500;
+                const shortAction = actor.data.lastAction ? actor.data.lastAction.replace(/^action-/, '') : '';
+                
+                html += '<div class="tree-actor ' + (isSel ? 'selected' : '') + (isRecent ? ' flash' : '') + '" data-actor="' + actor.name + '">';
+                html += '<span class="tree-actor-icon">📄</span>';
+                html += '<span class="tree-actor-name">' + actor.displayName + '</span>';
+                html += '<span class="tree-actor-action">' + shortAction + '</span>';
+                html += '<span class="tree-actor-vis ' + (actor.onScreen ? 'on' : 'off') + '"></span>';
+                html += '</div>';
+            });
+            html += '</div></div>';
+        });
+
+        container.innerHTML = html;
+
+        container.querySelectorAll('.tree-folder-header').forEach(h => {
+            h.onclick = () => {
+                const f = h.parentElement;
+                const name = f.dataset.folder;
+                f.classList.toggle('expanded');
+                if (f.classList.contains('expanded')) expandedFolders.add(name); else expandedFolders.delete(name);
+            };
+        });
+        container.querySelectorAll('.tree-actor').forEach(el => {
+            el.onclick = (e) => {
+                e.stopPropagation();
+                selectedActor = selectedActor === el.dataset.actor ? null : el.dataset.actor;
+                if (selectedActor) highlightActor(selectedActor); else clearHighlight();
+                render();
+            };
+        });
+    }
+
+    function renderTriggerCategories() {
+        const doc = tracerWindow.document;
+        const container = doc.getElementById('leftContent');
+        const search = doc.getElementById('search').value.toLowerCase();
+
+        const groups = {};
+        triggerData.forEach((data, name) => {
+            const cat = data.category;
+            if (!groups[cat]) groups[cat] = [];
+            groups[cat].push({ name, ...data });
+        });
+        Object.values(groups).forEach(arr => arr.sort((a, b) => b.count - a.count));
+
+        let total = 0, html = '';
+        Object.keys(TRIGGER_CATEGORIES).forEach(catName => {
+            const items = groups[catName];
+            if (!items || items.length === 0) return;
+            const filtered = search ? items.filter(i => i.name.toLowerCase().includes(search)) : items;
+            if (filtered.length === 0) return;
+            total += filtered.length;
+            
+            const cfg = TRIGGER_CATEGORIES[catName];
+            const isOpen = expandedTriggerCats.has(catName);
+
+            html += '<div class="cat ' + (isOpen ? 'open' : '') + '" data-cat="' + catName + '">';
+            html += '<div class="cat-header" style="border-left-color:' + cfg.color + '">';
+            html += '<span class="cat-chevron">▶</span>';
+            html += '<span class="cat-icon">' + cfg.icon + '</span>';
+            html += '<span class="cat-name">' + catName + '</span>';
+            html += '<span class="cat-count">' + filtered.length + '</span>';
+            html += '</div><div class="cat-items">';
+
+            filtered.forEach(item => {
+                const isSel = selectedTrigger === item.name;
+                html += '<div class="item ' + (isSel ? 'sel' : '') + '" data-name="' + item.name + '">';
+                html += '<span class="item-name">' + item.name + '</span>';
+                html += '<span class="item-cnt">×' + item.count + '</span>';
+                html += '</div>';
+            });
+            html += '</div></div>';
+        });
+
+        doc.getElementById('catCount').textContent = total;
+        container.innerHTML = html;
+
+        container.querySelectorAll('.cat-header').forEach(h => {
+            h.onclick = () => {
+                const c = h.parentElement;
+                const key = c.dataset.cat;
+                c.classList.toggle('open');
+                if (c.classList.contains('open')) expandedTriggerCats.add(key); else expandedTriggerCats.delete(key);
+            };
+        });
+        container.querySelectorAll('.item').forEach(el => {
+            el.onclick = (e) => {
+                e.stopPropagation();
+                selectedTrigger = selectedTrigger === el.dataset.name ? null : el.dataset.name;
+                render();
+            };
+        });
+    }
+
+    function renderDetailPanel() {
+        const doc = tracerWindow.document;
+        const body = doc.getElementById('detailBody');
+        
+        if (currentMode === 'actions') {
+            if (!selectedActor || !actorData.has(selectedActor)) {
+                body.innerHTML = '<div class="empty"><div class="empty-icon">🎭</div><div class="empty-text">Select an actor</div></div>';
+                return;
+            }
+            renderActorDetail(body);
+        } else {
+            if (!selectedTrigger || !triggerData.has(selectedTrigger)) {
+                body.innerHTML = '<div class="empty"><div class="empty-icon">⚡</div><div class="empty-text">Select a trigger</div></div>';
+                return;
+            }
+            renderTriggerDetail(body);
+        }
+    }
+
+    function renderActorDetail(container) {
+        const data = actorData.get(selectedActor);
+        const history = actorHistory.get(selectedActor);
+        const pathInfo = getActorPathInfo(selectedActor);
+        const enumName = getEnumName(selectedActor);
+
+        let html = '<div class="detail-title">📄 ' + selectedActor + '</div>';
+        
+        html += '<div class="section"><div class="section-head">File Location</div><div class="section-body">';
+        html += generatePathTreeHTML(pathInfo);
+        html += '</div></div>';
+
+        html += '<div class="section"><div class="section-head">Action History</div><div class="section-body">';
+        if (history && history.actions.length > 0) {
+            history.actions.forEach((h, idx) => {
+                const isCurrent = idx === 0;
+                const enumVal = actionToEnum(h.name);
+                html += '<div class="action-card ' + (isCurrent ? 'current' : '') + '">';
+                html += '<div class="action-card-header"><span class="action-name-text">' + formatActionName(h.name) + '</span><span class="action-count-badge">×' + h.count + '</span></div>';
+                html += '<div class="action-enum-row"><code class="action-enum">' + enumName + '.' + enumVal + '</code></div>';
+                if (h.params) {
+                    html += '<div class="action-params"><div class="action-params-value">' + JSON.stringify(h.params, null, 2) + '</div></div>';
+                }
+                html += '</div>';
+            });
+        } else {
+            html += '<div class="empty-sm">No actions recorded</div>';
+        }
+        html += '</div></div>';
+
+        container.innerHTML = html;
+    }
+
+    function renderTriggerDetail(container) {
+        const data = triggerData.get(selectedTrigger);
+        let html = '<div class="detail-title">⚡ ' + selectedTrigger + '</div>';
+        html += '<div class="detail-meta"><span class="meta-tag">' + getTriggerSource(selectedTrigger) + '</span><span class="meta-tag fire">🔥 ' + data.count + 'x</span></div>';
+
+        const receivers = data.receivers || [];
+        const categorized = categorizeReceivers(receivers);
+        
+        html += '<div class="section"><div class="section-head">Receivers (' + receivers.length + ')</div><div class="section-body">';
+        html += renderReceiverSection('reels', '🎰', 'Reels', categorized.reels, false);
+        html += renderReceiverSection('symbols', '💎', 'Symbols', categorized.symbols, true);
+        html += renderReceiverSection('other', '🎭', 'Other', categorized.other, false);
+        html += '</div></div>';
+
+        if (data.state && Object.keys(data.state).length > 0) {
+            html += '<div class="section"><div class="section-head">State</div><div class="section-body"><div class="state-grid">';
+            Object.entries(data.state).forEach(([k, v]) => {
+                html += '<div class="state-row"><div class="state-key">' + k + '</div><div class="state-val">' + JSON.stringify(v) + '</div></div>';
+            });
+            html += '</div></div></div>';
+        }
+
+        container.innerHTML = html;
+        
+        container.querySelectorAll('[data-actor]').forEach(el => {
+            el.onclick = (e) => {
+                e.stopPropagation();
+                const name = el.dataset.actor;
+                if (highlightedActorName === name) clearHighlight(); else highlightActor(name);
+            };
+        });
+        
+        container.querySelectorAll('.recv-cat-header').forEach(h => {
+            h.onclick = () => {
+                const c = h.parentElement;
+                const key = c.dataset.recv;
+                c.classList.toggle('open');
+                if (c.classList.contains('open')) expandedReceiverSections.add(key); else expandedReceiverSections.delete(key);
+            };
+        });
+    }
+
+    function renderTimeline() {
+        const doc = tracerWindow.document;
+        const body = doc.getElementById('detailBody');
+        const search = doc.getElementById('search').value.toLowerCase();
+        
+        const flow = currentMode === 'actions' ? actionFlow : triggerFlow;
+        const filtered = flow.filter(f => {
+            const name = currentMode === 'actions' ? f.action : f.name;
+            return !search || name.toLowerCase().includes(search);
+        });
+
+        doc.getElementById('catCount').textContent = filtered.length;
+        
+        let html = '<div class="timeline">';
+        filtered.slice(0, 50).forEach(f => {
+            const name = currentMode === 'actions' ? f.action : f.name;
+            const time = Date.now() - f.time < 1000 ? 'now' : Math.floor((Date.now() - f.time)/1000) + 's';
+            html += '<div class="tl-item"><div class="tl-time">' + time + '</div>';
+            html += '<div class="tl-line"><div class="tl-dot"></div><div class="tl-conn"></div></div>';
+            html += '<div class="tl-card"><div class="tl-name">' + name + '</div>';
+            if (currentMode === 'actions') html += '<div class="tl-actor">' + f.actor + '</div>';
+            else html += '<div class="tl-flow">' + (f.sender||'?') + ' → ' + (f.receivers?.length||0) + '</div>';
+            html += '</div></div>';
+        });
+        html += '</div>';
+        body.innerHTML = html;
+    }
+
+    function categorizeReceivers(receivers) {
+        const result = { reels: { onScreen: [], offScreen: [] }, symbols: { onScreen: [], offScreen: [] }, other: { onScreen: [], offScreen: [] } };
+        cachedReelBounds = null;
+        receivers.forEach(name => {
+            let type = 'other';
+            if (/^Reel-/i.test(name)) type = 'reel';
+            else if (/^(sym|scatter|wild)/i.test(name)) type = 'symbol';
+            
+            const vis = getActorVisibility(name);
+            const target = type === 'reel' ? result.reels : (type === 'symbol' ? result.symbols : result.other);
+            (vis.inArea ? target.onScreen : target.offScreen).push({ name, ...vis });
+        });
+        const sortFn = (a, b) => {
+            const ca = parseCellLabel(a.parentCell), cb = parseCellLabel(b.parentCell);
+            if (!ca && !cb) return 0; if (!ca) return 1; if (!cb) return -1;
+            return ca.reel !== cb.reel ? ca.reel - cb.reel : ca.cell - cb.cell;
+        };
+        result.symbols.onScreen.sort(sortFn);
+        result.symbols.offScreen.sort(sortFn);
+        return result;
+    }
+
+    function renderReceiverSection(key, icon, title, data, useGrid) {
+        if (data.onScreen.length + data.offScreen.length === 0) return '';
+        const isOpen = expandedReceiverSections.has(key);
+        let html = '<div class="recv-cat ' + (isOpen ? 'open' : '') + '" data-recv="' + key + '">';
+        html += '<div class="recv-cat-header"><span class="recv-chevron">▶</span><span class="recv-icon">' + icon + '</span><span class="recv-title">' + title + '</span>';
+        html += '<div class="recv-badges"><span class="recv-badge on">👁 ' + data.onScreen.length + '</span><span class="recv-badge off">○ ' + data.offScreen.length + '</span></div></div>';
+        html += '<div class="recv-cat-body">';
+        if (useGrid) html += renderGridSection([...data.onScreen, ...data.offScreen]);
+        else html += renderChipList([...data.onScreen, ...data.offScreen]);
+        html += '</div></div>';
+        return html;
+    }
+
+    function renderGridSection(items) {
+        const gridMap = {}, others = [];
+        items.forEach(item => {
+            const pos = parseCellLabel(item.parentCell);
+            if (pos) {
+                const key = pos.reel + '-' + pos.cell;
+                if (!gridMap[key]) gridMap[key] = [];
+                gridMap[key].push(item);
+            } else others.push(item);
+        });
+        
+        let maxR = 0, maxC = 0;
+        Object.keys(gridMap).forEach(k => { const [r, c] = k.split('-').map(Number); maxR = Math.max(maxR, r); maxC = Math.max(maxC, c); });
+        
+        if (maxR === 0 && maxC === 0 && others.length === items.length) return renderChipList(items);
+
+        let html = '<div class="grid-container"><div class="grid-table" style="grid-template-columns: 36px repeat(' + (maxR + 1) + ', 1fr);">';
+        html += '<div class="grid-header"></div>';
+        for (let r = 0; r <= maxR; r++) html += '<div class="grid-header">R' + r + '</div>';
+        for (let c = 0; c <= maxC; c++) {
+            html += '<div class="grid-header">C' + c + '</div>';
+            for (let r = 0; r <= maxR; r++) {
+                const cellItems = gridMap[r + '-' + c] || [];
+                html += '<div class="grid-cell' + (cellItems.some(i => i.inArea) ? ' has-on' : '') + '">';
+                cellItems.forEach(i => { html += '<div class="chip ' + (i.inArea ? 'on' : 'off') + '" data-actor="' + i.name + '">' + i.name.replace(/\[\d+\]$/, '') + '</div>'; });
+                html += '</div>';
+            }
+        }
+        html += '</div>';
+        if (others.length > 0) {
+            html += '<div class="other-section"><div class="other-chips">';
+            others.forEach(i => { html += '<div class="chip ' + (i.inArea ? 'on' : 'off') + '" data-actor="' + i.name + '">' + i.name + '</div>'; });
+            html += '</div></div>';
+        }
+        html += '</div>';
+        return html;
+    }
+
+    function renderChipList(items) {
+        let html = '<div class="other-chips">';
+        items.forEach(i => { html += '<div class="chip ' + (i.inArea ? 'on' : 'off') + '" data-actor="' + i.name + '">' + i.name.replace(/\[\d+\]$/, '') + '</div>'; });
+        html += '</div>';
+        return html;
+    }
+
+    function getEnumName(actorName) {
+        const baseName = actorName.replace(/\[\d+\]$/, '').replace(/^actor-/, '');
+        const pascal = baseName.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join('');
+        return pascal + 'ActorActions';
+    }
+
+    function actionToEnum(action) {
+        return String(action).replace(/^action-/, '').toUpperCase().replace(/-/g, '_');
+    }
+
+    function formatActionName(action) {
+        return String(action).replace(/^action-/, '').split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+    }
+
+    // ===== Window =====
+    function createWindow() {
+        if (tracerWindow && !tracerWindow.closed) { tracerWindow.focus(); return; }
+        const game = detectGameName();
+        tracerWindow = window.open('', 'FlowReactionMaster', 'width=1300,height=900,left=50,top=50');
+
+        tracerWindow.document.write(`<!DOCTYPE html>
+<html>
+<head>
+<title>Flow & Reaction Master - ${game}</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden}
+body{font-family:'Inter',sans-serif;font-size:13px;background:#0f0a1a;color:#e2e8f0;display:flex;flex-direction:column;transition:all .3s}
+
+/* Theme Variables */
+body[data-mode="actions"] { --theme-color: #f59e0b; --theme-bg: #451a03; }
+body[data-mode="triggers"] { --theme-color: #a78bfa; --theme-bg: #2e1065; }
+
+.header{padding:10px 16px;background:linear-gradient(180deg,#1a1025,#150d20);border-bottom:2px solid #2d2040;display:flex;gap:12px;align-items:center;transition:border-color .3s}
+body[data-mode="actions"] .header { border-bottom-color: #f59e0b; }
+body[data-mode="triggers"] .header { border-bottom-color: #a78bfa; }
+
+.brand{display:flex;align-items:center;gap:8px}
+.logo{font-size:22px}
+.title{font-weight:700;font-size:16px;color:#fff}
+
+.game-tag{background:#2d2040;color:#fff;padding:4px 10px;border-radius:10px;font-size:10px;font-weight:600}
+
+.mode-tabs{display:flex;background:#1e1530;border-radius:8px;padding:3px}
+.mode-tab{background:none;border:none;color:#9ca3af;padding:6px 16px;cursor:pointer;font:inherit;font-size:11px;font-weight:600;border-radius:6px;transition:all .15s}
+.mode-tab:hover{color:#fff}
+.mode-tab.actions.active{background:#f59e0b;color:#fff}
+.mode-tab.triggers.active{background:#a78bfa;color:#fff}
+
+.status{padding:4px 12px;border-radius:12px;font-size:10px;font-weight:600;background:#22c55e;color:#000}
+.status.paused{background:#ef4444;color:#fff}
+
+.view-tabs{display:flex;background:#1e1530;border-radius:6px;padding:2px}
+.view-tab{background:none;border:none;color:#6b7280;padding:5px 12px;cursor:pointer;font:inherit;font-size:11px;border-radius:4px}
+.view-tab:hover{color:#fff}
+.view-tab.active{background:#2d2040;color:#fff}
+
+.search{background:#1e1530;border:1px solid #2d2040;color:#fff;padding:6px 12px;border-radius:8px;width:160px;font:inherit;font-size:12px}
+.search:focus{outline:none;border-color:var(--theme-color)}
+
+.btn{background:#1e1530;color:#e2e8f0;border:1px solid #2d2040;border-radius:8px;padding:6px 14px;cursor:pointer;font:inherit;font-size:11px}
+.btn:hover{background:#2d2040}
+.btn.danger{color:#f87171}
+
+.main{flex:1;display:flex;overflow:hidden}
+.left{width:320px;background:#150d20;border-right:1px solid #2d2040;display:flex;flex-direction:column}
+.left-header{padding:10px 12px;background:#1a1025;border-bottom:1px solid #2d2040;font-size:10px;font-weight:600;color:#9ca3af;text-transform:uppercase;display:flex;justify-content:space-between;letter-spacing:.5px}
+.count-badge{background:var(--theme-color);color:#fff;padding:2px 8px;border-radius:10px;font-size:10px;transition:background .3s}
+
+#leftContent{flex:1;overflow-y:auto;padding:6px 0}
+#leftContent::-webkit-scrollbar{width:6px}
+#leftContent::-webkit-scrollbar-thumb{background:#2d2040;border-radius:3px}
+
+/* Tree Styles */
+.tree-folder{user-select:none}
+.tree-folder-header{display:flex;align-items:center;padding:6px 12px;cursor:pointer;transition:background .15s;border-left:3px solid transparent}
+.tree-folder-header:hover{background:#1e1530}
+.tree-chevron{width:16px;font-size:10px;color:#6b7280;transition:transform .15s}
+.tree-folder.expanded>.tree-folder-header .tree-chevron{transform:rotate(90deg)}
+.tree-folder-icon{margin-right:8px;font-size:14px}
+.tree-folder-name{flex:1;font-weight:600;font-size:12px;color:#d1d5db}
+.tree-folder-badge{background:#1e1530;padding:2px 6px;border-radius:8px;font-size:10px;color:#9ca3af}
+.tree-folder-children{display:none;padding-left:12px}
+.tree-folder.expanded>.tree-folder-children{display:block}
+
+.tree-actor{display:flex;align-items:center;padding:4px 12px 4px 24px;cursor:pointer;transition:all .15s;border-left:3px solid transparent;margin:1px 0}
+.tree-actor:hover{background:#1e1530}
+.tree-actor.selected{background:#2e1a4a;border-left-color:#f59e0b}
+.tree-actor.flash{animation:flash .5s ease-out}
+@keyframes flash{0%{background:#22c55e40}100%{background:transparent}}
+.tree-actor-icon{font-size:12px;margin-right:8px;opacity:.7}
+.tree-actor-name{flex:1;font-size:11px;color:#e5e7eb;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tree-actor-action{font-size:10px;color:#fbbf24;margin-left:8px;max-width:100px;overflow:hidden;text-overflow:ellipsis}
+.tree-actor-vis{width:6px;height:6px;border-radius:50%;margin-left:8px}
+.tree-actor-vis.on{background:#22c55e;box-shadow:0 0 4px #22c55e}
+.tree-actor-vis.off{background:#4b5563}
+
+/* Category Styles */
+.cat{margin-bottom:2px}
+.cat-header{display:flex;align-items:center;gap:8px;padding:8px 12px;cursor:pointer;border-left:3px solid transparent;transition:all .15s}
+.cat-header:hover{background:#1e1530}
+.cat-chevron{font-size:10px;color:#6b7280;transition:transform .15s}
+.cat.open>.cat-header .cat-chevron{transform:rotate(90deg)}
+.cat-icon{font-size:14px}
+.cat-name{flex:1;font-size:12px;font-weight:600}
+.cat-count{font-size:10px;color:#6b7280}
+.cat-items{display:none}
+.cat.open>.cat-items{display:block}
+.item{display:flex;align-items:center;gap:6px;padding:6px 12px 6px 28px;cursor:pointer;border-left:3px solid transparent;transition:all .15s}
+.item:hover{background:#1e1530}
+.item.sel{background:#2e1a4a;border-left-color:#a78bfa}
+.item-name{flex:1;font-size:11px;color:#d1d5db}
+.item-cnt{font-size:9px;color:#6b7280;background:#1e1530;padding:2px 6px;border-radius:8px}
+
+.right{flex:1;display:flex;flex-direction:column;background:#0f0a1a;overflow:hidden}
+#detailBody{flex:1;overflow-y:auto;padding:16px}
+#detailBody::-webkit-scrollbar{width:6px}
+#detailBody::-webkit-scrollbar-thumb{background:#2d2040;border-radius:3px}
+
+.detail-title{font-size:16px;font-weight:700;color:#fff;margin-bottom:8px}
+.detail-meta{display:flex;gap:8px;margin-bottom:16px}
+.meta-tag{background:#1e1530;padding:4px 10px;border-radius:6px;font-size:11px;color:#a78bfa}
+.meta-tag.fire{color:#f97316}
+
+.section{background:#150d20;border:1px solid #2d2040;border-radius:10px;margin-bottom:12px}
+.section-head{padding:10px 14px;background:#1a1025;font-size:11px;font-weight:600;color:#9ca3af;text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid #2d2040;border-radius:10px 10px 0 0}
+.section-body{padding:14px}
+
+.path-tree{font-family:'JetBrains Mono',monospace;font-size:11px}
+.tree-row{display:flex;align-items:center;padding:2px 0}
+.tree-branch{color:#4b5563;margin-right:6px}
+.tree-icon{margin-right:6px}
+.folder-name{color:#9ca3af}
+.file-highlight{background:#1e1530;margin:4px -14px;padding:6px 14px}
+.file-name{color:#60a5fa;font-weight:600}
+
+.action-card{background:#1a1025;border:1px solid #2d2040;border-radius:8px;margin-bottom:8px;overflow:hidden}
+.action-card.current{border-color:#f59e0b;box-shadow:0 0 0 1px #f59e0b40}
+.action-card-header{padding:8px 12px;display:flex;justify-content:space-between;align-items:center;background:#1e1530}
+.action-name-text{font-weight:600;color:#fbbf24;font-size:12px}
+.action-count-badge{font-size:10px;color:#9ca3af}
+.action-enum-row{padding:8px 12px;background:#150d20}
+.action-enum{font-family:'JetBrains Mono',monospace;font-size:10px;color:#81ecec}
+.action-params{padding:8px 12px;background:#0d0815;border-top:1px solid #2d2040}
+.action-params-value{font-family:'JetBrains Mono',monospace;font-size:10px;color:#d1d5db;white-space:pre-wrap}
+
+.recv-cat{margin-bottom:8px;border:1px solid #2d2040;border-radius:8px;overflow:hidden}
+.recv-cat-header{display:flex;align-items:center;gap:8px;padding:10px 14px;background:#1a1025;cursor:pointer;transition:all .15s}
+.recv-cat-header:hover{background:#1e1530}
+.recv-chevron{font-size:10px;color:#6b7280;transition:transform .15s}
+.recv-cat.open>.recv-cat-header .recv-chevron{transform:rotate(90deg)}
+.recv-icon{font-size:16px}
+.recv-title{flex:1;font-size:13px;font-weight:600}
+.recv-badges{display:flex;gap:6px}
+.recv-badge{font-size:10px;padding:3px 8px;border-radius:10px;font-weight:600}
+.recv-badge.on{background:#166534;color:#86efac}
+.recv-badge.off{background:#374151;color:#9ca3af}
+.recv-cat-body{display:none;padding:12px;background:#0d0815}
+.recv-cat.open>.recv-cat-body{display:block}
+
+.grid-container{margin-bottom:10px}
+.grid-table{display:grid;gap:3px;background:#12101a;border-radius:8px;padding:6px}
+.grid-header{font-size:11px;color:#8b9aaf;text-align:center;padding:8px 4px;font-weight:600;background:#1a1530;border-radius:4px}
+.grid-cell{background:#1a1228;border-radius:6px;padding:6px;min-height:44px;display:flex;flex-direction:column;gap:4px;justify-content:center;align-items:center;transition:all .15s}
+.grid-cell.has-on{background:#0f1f1a;border:1px solid #16513480}
+
+.chip{font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:500;padding:4px 8px;border-radius:5px;cursor:pointer;transition:all .15s;white-space:nowrap}
+.chip.on{background:linear-gradient(135deg,#166534,#14532d);color:#86efac;border:1px solid #22c55e;box-shadow:0 2px 4px #00000040}
+.chip.off{background:#1e1530;color:#6b7280;border:1px solid #2d2040;opacity:.5}
+.chip:hover{transform:scale(1.05);opacity:1!important;box-shadow:0 4px 12px #00000060}
+
+.state-grid{display:flex;flex-direction:column;gap:6px}
+.state-row{display:flex;background:#1e1530;border-radius:6px;overflow:hidden}
+.state-key{background:#2e1a4a;padding:8px 12px;min-width:100px;font-family:'JetBrains Mono',monospace;font-size:11px;color:#c4b5fd}
+.state-val{padding:8px 12px;flex:1;font-family:'JetBrains Mono',monospace;font-size:11px;color:#fbbf24;word-break:break-all}
+
+.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:#6b7280}
+.empty-icon{font-size:48px;margin-bottom:16px;opacity:.5}
+.empty-text{font-size:14px}
+.empty-sm{color:#6b7280;text-align:center;padding:12px;font-size:12px}
+
+.timeline{padding:8px}
+.tl-item{display:flex;gap:10px;margin-bottom:3px}
+.tl-time{width:36px;font-size:10px;color:#6b7280;text-align:right;padding-top:10px;font-family:'JetBrains Mono',monospace}
+.tl-line{width:20px;display:flex;flex-direction:column;align-items:center}
+.tl-dot{width:10px;height:10px;border-radius:50%;margin-top:12px;background:#4b5563}
+.tl-conn{width:2px;flex:1;background:#2d2040}
+.tl-item:last-child .tl-conn{display:none}
+.tl-card{flex:1;background:#150d20;border:1px solid #2d2040;border-radius:8px;padding:10px 12px}
+.tl-name{font-weight:600;font-size:12px;color:#c4b5fd;margin-bottom:4px}
+.tl-actor{font-size:11px;color:#fbbf24}
+.tl-flow{font-size:11px;color:#9ca3af}
+</style>
+</head>
+<body>
+<div class="header">
+<div class="brand"><span class="logo">⚡</span><span class="title">Flow & Reaction Master</span></div>
+<span class="game-tag">${game}</span>
+<div class="mode-tabs">
+<button id="actionsMode" class="mode-tab actions active">🎬 Actions</button>
+<button id="triggersMode" class="mode-tab triggers">⚡ Triggers</button>
+</div>
+<span id="status" class="status">Recording</span>
+<div class="view-tabs">
+<button id="splitView" class="view-tab active">Split</button>
+<button id="tlView" class="view-tab">Timeline</button>
+</div>
+<input id="search" class="search" placeholder="Search...">
+<div style="flex:1"></div>
+<button id="pauseBtn" class="btn">⏸ Pause</button>
+<button id="clearBtn" class="btn danger">Clear</button>
+</div>
+<div class="main">
+<div class="left">
+<div class="left-header"><span>EXPLORER</span><span class="count-badge" id="catCount">0</span></div>
+<div id="leftContent"></div>
+</div>
+<div class="right">
+<div id="detailBody">
+<div class="empty"><div class="empty-icon">🎬</div><div class="empty-text">Select an item</div></div>
+</div>
+</div>
+</div>
+</body>
+</html>`);
+
+        tracerWindow.document.close();
+        setTimeout(setupEvents, 100);
+    }
+
+    function setupEvents() {
+        if (!tracerWindow || tracerWindow.closed) return;
+        const doc = tracerWindow.document;
+
+        doc.getElementById('actionsMode').onclick = () => {
+            currentMode = 'actions';
+            selectedActor = null;
+            doc.getElementById('actionsMode').classList.add('active');
+            doc.getElementById('triggersMode').classList.remove('active');
+            render();
+        };
+
+        doc.getElementById('triggersMode').onclick = () => {
+            currentMode = 'triggers';
+            selectedTrigger = null;
+            doc.getElementById('triggersMode').classList.add('active');
+            doc.getElementById('actionsMode').classList.remove('active');
+            render();
+        };
+
+        doc.getElementById('splitView').onclick = () => {
+            currentView = 'split';
+            doc.getElementById('splitView').classList.add('active');
+            doc.getElementById('tlView').classList.remove('active');
+            doc.querySelector('.left').style.display = 'flex';
+            render();
+        };
+
+        doc.getElementById('tlView').onclick = () => {
+            currentView = 'timeline';
+            doc.getElementById('tlView').classList.add('active');
+            doc.getElementById('splitView').classList.remove('active');
+            doc.querySelector('.left').style.display = 'none';
+            render();
+        };
+
+        doc.getElementById('pauseBtn').onclick = () => {
+            isPaused = !isPaused;
+            doc.getElementById('pauseBtn').textContent = isPaused ? '▶ Resume' : '⏸ Pause';
+            doc.getElementById('status').textContent = isPaused ? 'Paused' : 'Recording';
+            doc.getElementById('status').className = 'status' + (isPaused ? ' paused' : '');
+        };
+
+        doc.getElementById('clearBtn').onclick = () => {
+            actorData.clear(); actorHistory.clear(); triggerData.clear();
+            actionFlow.length = 0; triggerFlow.length = 0;
+            selectedActor = null; selectedTrigger = null;
+            clearHighlight();
+            render();
+        };
+
+        doc.getElementById('search').oninput = () => render();
+        tracerWindow.onbeforeunload = () => clearHighlight();
+    }
+
+    function init() {
+        if (isInitialized) return;
+        isInitialized = true;
+        hookAllActors();
+        setInterval(hookAllActors, 2000);
+    }
+
+    document.addEventListener('keydown', (e) => {
+        if (e.altKey && e.key === '8') {
+            e.preventDefault();
+            if (tracerWindow && !tracerWindow.closed) { tracerWindow.focus(); return; }
+            if (!window.ZeusPlay?.actors?.actorsRegistry) { console.log('[Flow & Reaction Master] ⏳ Waiting...'); return; }
+            init();
+            createWindow();
+        }
+    });
+
+    console.log('[Flow & Reaction Master v2.2] ✅ Alt+8 - Ready');
+})();
