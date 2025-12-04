@@ -1,0 +1,1099 @@
+// ==UserScript==
+// @name         Zeus V3 Flow Tracer Pro
+// @namespace    http://tampermonkey.net/
+// @version      16.0
+// @description  Beautiful flow tracer with tree view - Alt+6
+// @author       Debug Helper
+// @match        http://localhost:*/*
+// @match        https://localhost:*/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    const script = document.createElement('script');
+    script.textContent = `
+    (function() {
+        let tracerWindow = null;
+        let isPaused = false;
+        const hookedActors = new Set();
+        const actorData = new Map();
+        const actorHistory = new Map();
+        const actionFlow = [];
+        let selectedActor = null;
+        let isInitialized = false;
+        let highlightOverlay = null;
+        let pixiApp = null;
+        let refreshInterval = null;
+        let detectedGameName = '';
+        let currentView = 'actors';
+        let expandedFolders = new Set(['actors']); // Track expanded folders
+        const MAX_FLOW = 100;
+
+        const actorColors = {
+            'game-scene': '#FF6B6B',
+            'symbols': '#4ECDC4',
+            'coins': '#FFD93D',
+            'stickies': '#6BCB77',
+            'win': '#9B59B6',
+            'splash': '#3498DB',
+            'logo': '#E67E22',
+            'background': '#1ABC9C',
+            'particles': '#F39C12',
+            'dialog': '#E74C3C',
+            'pay-lines': '#9B59B6',
+            'collectors': '#2ECC71',
+            'default': '#95A5A6'
+        };
+
+        function getActorColor(actorName) {
+            for (const [key, color] of Object.entries(actorColors)) {
+                if (actorName.includes(key)) return color;
+            }
+            return actorColors.default;
+        }
+
+        function detectGameName() {
+            if (detectedGameName) return detectedGameName;
+            const path = window.location.pathname;
+            let match = path.match(/games\\/([^/]+)/);
+            if (match) { detectedGameName = match[1]; return detectedGameName; }
+            const scripts = document.querySelectorAll('script[src]');
+            for (const s of scripts) {
+                match = s.src.match(/games\\/([^/]+)/);
+                if (match) { detectedGameName = match[1]; return detectedGameName; }
+            }
+            return 'game';
+        }
+
+        // Build tree structure from actors
+        function buildActorTree() {
+            const tree = { name: 'actors', type: 'folder', children: {}, actors: [] };
+
+            actorData.forEach((data, actorName) => {
+                // Parse actor name to get category
+                const cleanName = actorName.replace(/^actor-/, '').replace(/\\[\\d+\\]$/, '');
+                const parts = cleanName.split('-');
+
+                // Determine folder based on first part(s)
+                let folder = 'other';
+                let displayName = cleanName;
+
+                const folderMappings = [
+                    { match: /^(game-scene)/, folder: 'game-scene' },
+                    { match: /^(symbols)/, folder: 'symbols' },
+                    { match: /^(coins|collectors)/, folder: 'coins' },
+                    { match: /^(stickies|sticky)/, folder: 'stickies' },
+                    { match: /^(win-animations|win-counter)/, folder: 'win' },
+                    { match: /^(splash-screen)/, folder: 'splash-screen' },
+                    { match: /^(logo)/, folder: 'logo' },
+                    { match: /^(background)/, folder: 'background' },
+                    { match: /^(particles)/, folder: 'particles' },
+                    { match: /^(dialog)/, folder: 'dialog-box' },
+                    { match: /^(pay-lines)/, folder: 'pay-lines' },
+                    { match: /^(postpone)/, folder: 'postpone' },
+                    { match: /^(back|front|middle)$/, folder: 'core' },
+                    { match: /^(live-paytable)/, folder: 'core' },
+                ];
+
+                for (const mapping of folderMappings) {
+                    if (mapping.match.test(cleanName)) {
+                        folder = mapping.folder;
+                        break;
+                    }
+                }
+
+                // Create folder if doesn't exist
+                if (!tree.children[folder]) {
+                    tree.children[folder] = {
+                        name: folder,
+                        type: 'folder',
+                        children: {},
+                        actors: [],
+                        color: getActorColor(folder)
+                    };
+                }
+
+                // Add actor to folder
+                tree.children[folder].actors.push({
+                    name: actorName,
+                    displayName: cleanName,
+                    data: data,
+                    color: getActorColor(cleanName)
+                });
+            });
+
+            // Sort actors in each folder by last activity
+            Object.values(tree.children).forEach(folder => {
+                folder.actors.sort((a, b) => b.data.lastTime - a.data.lastTime);
+            });
+
+            return tree;
+        }
+
+        function getActorPathInfo(actorName) {
+            const baseName = actorName.replace(/\\[\\d+\\]$/, '');
+            const gameName = detectGameName();
+            let pathSegments = [];
+            let fileName = '';
+
+            const patterns = [
+                { match: /^actor-symbols-coins-and-collectors-collecting-effect-backgrounds$/, segments: ['symbols', 'coins-and-collectors'], file: 'collecting-effect-backgrounds-actor.ts' },
+                { match: /^actor-symbols-coins-glow-effect-backgrounds$/, segments: ['symbols', 'coins'], file: 'glow-effect-backgrounds-actor.ts' },
+                { match: /^actor-symbols-(.+)$/, segments: ['symbols'], file: 'symbol-{1}-actor.ts' },
+                { match: /^actor-coins$/, segments: ['coins', 'collectable'], file: 'coins-actor.ts' },
+                { match: /^actor-coins-for-logo$/, segments: ['coins'], file: 'coins-for-logo-actor.ts' },
+                { match: /^actor-coins-particles$/, segments: [], file: 'coins-particles-actor.ts' },
+                { match: /^actor-collectors$/, segments: ['coins', 'collectors'], file: 'collectors-actor.ts' },
+                { match: /^actor-stickies$/, segments: ['stickies'], file: 'stickies-actor.ts' },
+                { match: /^actor-sticky$/, segments: ['stickies', 'sticky'], file: 'sticky-actor.ts' },
+                { match: /^actor-game-scene-frame$/, segments: ['game-scene'], file: 'game-scene-frame-actor.ts' },
+                { match: /^actor-game-scene-background$/, segments: ['game-scene'], file: 'game-scene-background-actor.ts' },
+                { match: /^actor-game-scene-coins$/, segments: ['game-scene'], file: 'game-scene-coins-actor.ts' },
+                { match: /^actor-game-scene-(.+)$/, segments: ['game-scene'], file: 'game-scene-{1}-actor.ts' },
+                { match: /^actor-game-scene$/, segments: ['game-scene'], file: 'game-scene-actor.ts' },
+                { match: /^actor-splash-screen-(.+)$/, segments: ['splash-screen'], file: 'splash-screen-{1}-actor.ts' },
+                { match: /^actor-splash-screen$/, segments: ['splash-screen'], file: 'splash-screen-actor.ts' },
+                { match: /^actor-win-animations-(.+)$/, segments: ['win-animations'], file: 'win-animations-{1}-actor.ts' },
+                { match: /^actor-win-animations$/, segments: ['win-animations'], file: 'win-animations-actor.ts' },
+                { match: /^actor-win-counter$/, segments: ['win-counter'], file: 'win-counter-actor.ts' },
+                { match: /^actor-logo$/, segments: ['logo'], file: 'logo-actor.ts' },
+                { match: /^actor-background-(.+)$/, segments: ['background'], file: 'background-{1}-actor.ts' },
+                { match: /^actor-background$/, segments: ['background'], file: 'background-actor.ts' },
+                { match: /^actor-particles-(.+)$/, segments: ['particles'], file: 'particles-{1}-actor.ts' },
+                { match: /^actor-pay-lines$/, segments: ['pay-lines'], file: 'pay-lines-actor.ts' },
+                { match: /^actor-postpone-(.+)$/, segments: ['postpone'], file: 'postpone-{1}-actor.ts' },
+                { match: /^actor-postpone$/, segments: ['postpone'], file: 'postpone-actor.ts' },
+                { match: /^actor-dialog-box$/, segments: ['dialog-box'], file: 'dialog-box-actor.ts' },
+                { match: /^actor-live-paytable$/, segments: [], file: 'live-paytable-actor.ts' },
+                { match: /^actor-back$/, segments: [], file: 'back-actor.ts' },
+                { match: /^actor-front$/, segments: [], file: 'front-actor.ts' },
+                { match: /^actor-middle$/, segments: [], file: 'middle-actor.ts' },
+                { match: /^actor-(.+)$/, segments: [], file: '{1}-actor.ts' },
+            ];
+
+            for (const p of patterns) {
+                const m = baseName.match(p.match);
+                if (m) {
+                    pathSegments = [...p.segments];
+                    fileName = p.file;
+                    if (m[1]) fileName = fileName.replace('{1}', m[1]);
+                    break;
+                }
+            }
+            if (!fileName) fileName = baseName + '.ts';
+
+            const fullSegments = [gameName, 'src', 'actors', ...pathSegments];
+            const fullPath = 'games/' + fullSegments.join('/') + '/' + fileName;
+            return { gameName, segments: fullSegments, fileName, fullPath };
+        }
+
+        function generatePathTreeHTML(pathInfo) {
+            const { segments, fileName } = pathInfo;
+            let html = '<div class="path-tree">';
+            html += '<div class="tree-row"><span class="tree-icon">📦</span><span class="folder-name">games</span></div>';
+            segments.forEach((seg, idx) => {
+                const indent = (idx + 1) * 18;
+                let icon = '📁';
+                if (seg === 'src') icon = '💻';
+                else if (seg === 'actors') icon = '🎭';
+                html += '<div class="tree-row" style="padding-left:' + indent + 'px;">';
+                html += '<span class="tree-branch">└</span>';
+                html += '<span class="tree-icon">' + icon + '</span>';
+                html += '<span class="folder-name">' + seg + '</span>';
+                html += '</div>';
+            });
+            if (fileName) {
+                const indent = (segments.length + 1) * 18;
+                html += '<div class="tree-row file-highlight" style="padding-left:' + indent + 'px;">';
+                html += '<span class="tree-branch">└</span>';
+                html += '<span class="tree-icon">📄</span>';
+                html += '<span class="file-name">' + fileName + '</span>';
+                html += '</div>';
+            }
+            html += '</div>';
+            return html;
+        }
+
+        function getEnumName(actorName) {
+            const baseName = actorName.replace(/\\[\\d+\\]$/, '').replace(/^actor-/, '').replace(/-actor$/, '');
+            const pascal = baseName.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join('');
+            return pascal + 'ActorActions';
+        }
+
+        function actionToEnum(action) {
+            return String(action).replace(/^action-/, '').toUpperCase().replace(/-/g, '_');
+        }
+
+        function formatActionName(action) {
+            return String(action).replace(/^action-/, '').split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+        }
+
+        function formatParams(params) {
+            if (!params || typeof params !== 'object') return null;
+            try {
+                const str = JSON.stringify(params, null, 2);
+                if (str === '{}' || str === '[]') return null;
+                return str;
+            } catch (e) { return null; }
+        }
+
+        function getRelativeTime(timestamp) {
+            const diff = Date.now() - timestamp;
+            if (diff < 1000) return 'now';
+            if (diff < 60000) return Math.floor(diff / 1000) + 's';
+            if (diff < 3600000) return Math.floor(diff / 60000) + 'm';
+            return Math.floor(diff / 3600000) + 'h';
+        }
+
+        function findPixiApp() {
+            if (pixiApp) return pixiApp;
+            const canvas = document.querySelector('canvas');
+            pixiApp = canvas?.__PIXI_APP__ || window.__PIXI_APP__ || window.pixiApp || window.app;
+            return pixiApp;
+        }
+
+        function createHighlightOverlay() {
+            if (highlightOverlay) return highlightOverlay;
+            const div = document.createElement('div');
+            div.id = '__flow_tracer_highlight__';
+            Object.assign(div.style, {
+                position: 'fixed', border: '3px solid #4ECDC4',
+                background: 'rgba(78, 205, 196, 0.15)',
+                boxShadow: '0 0 20px rgba(78,205,196,0.4)',
+                pointerEvents: 'none', zIndex: '2147483645',
+                display: 'none', borderRadius: '8px',
+            });
+            const label = document.createElement('div');
+            Object.assign(label.style, {
+                position: 'absolute', bottom: '100%', left: '0',
+                background: '#4ECDC4', color: '#000',
+                padding: '4px 12px', fontSize: '11px',
+                fontFamily: 'system-ui', fontWeight: '600',
+                borderRadius: '6px 6px 0 0',
+            });
+            div.appendChild(label);
+            document.body.appendChild(div);
+            highlightOverlay = div;
+            return div;
+        }
+
+        function clearHighlight() { if (highlightOverlay) highlightOverlay.style.display = 'none'; }
+
+        function updateHighlight() {
+            if (!selectedActor) { clearHighlight(); return; }
+            const data = actorData.get(selectedActor);
+            if (!data?.pixiContainer) { clearHighlight(); return; }
+            const obj = data.pixiContainer;
+            const app = findPixiApp();
+            if (!obj.parent && obj !== app?.stage) { clearHighlight(); return; }
+            try {
+                const bounds = obj.getBounds();
+                if (!bounds || bounds.width === 0 || bounds.height === 0) { clearHighlight(); return; }
+                const canvas = app?.view || app?.renderer?.view;
+                if (!canvas) { clearHighlight(); return; }
+                const rect = canvas.getBoundingClientRect();
+                const sx = rect.width / (app.renderer?.width || canvas.width);
+                const sy = rect.height / (app.renderer?.height || canvas.height);
+                const overlay = createHighlightOverlay();
+                Object.assign(overlay.style, {
+                    left: (rect.left + bounds.x * sx) + 'px',
+                    top: (rect.top + bounds.y * sy) + 'px',
+                    width: (bounds.width * sx) + 'px',
+                    height: (bounds.height * sy) + 'px',
+                    display: 'block',
+                });
+                overlay.firstChild.textContent = selectedActor;
+            } catch (e) { clearHighlight(); }
+        }
+
+        function createTracerWindow() {
+            if (tracerWindow && !tracerWindow.closed) { tracerWindow.focus(); return; }
+            const gameName = detectGameName();
+            tracerWindow = window.open('', 'FlowTracerPro', 'width=1500,height=950,left=50,top=50');
+
+            tracerWindow.document.write(\`<!DOCTYPE html>
+<html>
+<head>
+    <title>Flow Tracer - \${gameName}</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Inter', system-ui, sans-serif;
+            font-size: 13px;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            color: #e8e8e8;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .header {
+            padding: 12px 20px;
+            background: rgba(0,0,0,0.4);
+            backdrop-filter: blur(10px);
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+            display: flex;
+            gap: 16px;
+            align-items: center;
+        }
+        .brand { display: flex; align-items: center; gap: 10px; }
+        .logo { font-size: 28px; }
+        .title {
+            font-weight: 700; font-size: 18px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .game-badge {
+            background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+            color: #000; padding: 6px 14px; border-radius: 20px;
+            font-size: 12px; font-weight: 600;
+        }
+        .status-pill {
+            padding: 6px 16px; border-radius: 20px;
+            font-size: 11px; font-weight: 600;
+            display: flex; align-items: center; gap: 6px;
+        }
+        .status-pill.recording { background: linear-gradient(135deg, #00b894 0%, #00cec9 100%); color: #000; }
+        .status-pill.paused { background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%); color: #fff; }
+        .status-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; animation: pulse 1.5s infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .status-pill.paused .status-dot { animation: none; }
+
+        .view-switcher { display: flex; background: rgba(255,255,255,0.1); border-radius: 12px; padding: 4px; }
+        .view-btn {
+            background: transparent; border: none; color: rgba(255,255,255,0.6);
+            padding: 8px 20px; cursor: pointer; font: inherit; font-weight: 500;
+            border-radius: 8px; transition: all 0.2s;
+        }
+        .view-btn:hover { color: #fff; background: rgba(255,255,255,0.1); }
+        .view-btn.active {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #fff; box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
+        }
+
+        .search-box {
+            background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.2);
+            color: #fff; padding: 8px 16px; border-radius: 10px; width: 200px; font: inherit;
+        }
+        .search-box:focus { outline: none; border-color: #667eea; background: rgba(255,255,255,0.15); }
+        .search-box::placeholder { color: rgba(255,255,255,0.4); }
+
+        .header-btn {
+            background: rgba(255,255,255,0.1); color: #fff;
+            border: 1px solid rgba(255,255,255,0.2); border-radius: 10px;
+            padding: 8px 16px; cursor: pointer; font: inherit; font-weight: 500;
+        }
+        .header-btn:hover { background: rgba(255,255,255,0.2); }
+        .header-btn.danger { background: rgba(231, 76, 60, 0.2); border-color: rgba(231, 76, 60, 0.4); color: #e74c3c; }
+
+        .main { flex: 1; display: flex; overflow: hidden; }
+
+        /* ===== TREE PANEL ===== */
+        .tree-panel {
+            width: 400px;
+            background: rgba(0,0,0,0.3);
+            backdrop-filter: blur(10px);
+            border-right: 1px solid rgba(255,255,255,0.1);
+            display: flex;
+            flex-direction: column;
+        }
+        .panel-header {
+            padding: 14px 18px;
+            background: rgba(0,0,0,0.3);
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+            font-weight: 600; font-size: 11px;
+            color: rgba(255,255,255,0.5);
+            text-transform: uppercase; letter-spacing: 1.5px;
+            display: flex; justify-content: space-between; align-items: center;
+        }
+        .panel-count {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 4px 12px; border-radius: 12px; color: #fff; font-weight: 700;
+        }
+
+        .tree-container { flex: 1; overflow-y: auto; padding: 8px 0; }
+        .tree-container::-webkit-scrollbar { width: 6px; }
+        .tree-container::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 3px; }
+
+        /* ===== TREE STYLES ===== */
+        .tree-folder {
+            user-select: none;
+        }
+        .tree-folder-header {
+            display: flex;
+            align-items: center;
+            padding: 8px 12px 8px 16px;
+            cursor: pointer;
+            transition: background 0.15s;
+            border-left: 3px solid transparent;
+        }
+        .tree-folder-header:hover {
+            background: rgba(255,255,255,0.05);
+        }
+        .tree-chevron {
+            width: 20px;
+            height: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 10px;
+            color: rgba(255,255,255,0.4);
+            transition: transform 0.2s;
+            flex-shrink: 0;
+        }
+        .tree-folder.expanded > .tree-folder-header .tree-chevron {
+            transform: rotate(90deg);
+        }
+        .tree-folder-icon {
+            font-size: 16px;
+            margin-right: 8px;
+        }
+        .tree-folder-name {
+            font-weight: 600;
+            font-size: 12px;
+            color: rgba(255,255,255,0.9);
+            flex: 1;
+        }
+        .tree-folder-badge {
+            background: rgba(255,255,255,0.1);
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 10px;
+            color: rgba(255,255,255,0.5);
+        }
+        .tree-folder-children {
+            display: none;
+            padding-left: 12px;
+        }
+        .tree-folder.expanded > .tree-folder-children {
+            display: block;
+        }
+
+        /* Actor item in tree */
+        .tree-actor {
+            display: flex;
+            align-items: center;
+            padding: 6px 12px 6px 28px;
+            cursor: pointer;
+            transition: all 0.15s;
+            border-left: 3px solid transparent;
+            margin: 2px 0;
+        }
+        .tree-actor:hover {
+            background: rgba(255,255,255,0.05);
+        }
+        .tree-actor.selected {
+            background: linear-gradient(90deg, rgba(102, 126, 234, 0.3) 0%, rgba(102, 126, 234, 0.1) 100%);
+            border-left-color: #667eea;
+        }
+        .tree-actor.flash {
+            animation: actorFlash 0.5s ease-out;
+        }
+        @keyframes actorFlash {
+            0% { background: rgba(0, 184, 148, 0.4); }
+            100% { background: transparent; }
+        }
+        .tree-actor-icon {
+            font-size: 14px;
+            margin-right: 8px;
+            opacity: 0.7;
+        }
+        .tree-actor-name {
+            flex: 1;
+            font-size: 12px;
+            color: rgba(255,255,255,0.85);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .tree-actor-action {
+            font-size: 10px;
+            color: #ffeaa7;
+            max-width: 120px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            margin-left: 8px;
+        }
+        .tree-actor-calls {
+            font-size: 9px;
+            color: rgba(255,255,255,0.4);
+            margin-left: 8px;
+        }
+
+        /* ===== RIGHT PANEL ===== */
+        .right-panel {
+            flex: 1; display: flex; flex-direction: column;
+            background: rgba(0,0,0,0.2); overflow: hidden;
+        }
+
+        .detail-header {
+            padding: 20px 24px;
+            background: rgba(0,0,0,0.3);
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+        }
+        .detail-title-row {
+            display: flex; align-items: center; gap: 12px; margin-bottom: 10px;
+        }
+        .detail-color-bar { width: 4px; height: 28px; border-radius: 2px; }
+        .detail-title { font-size: 18px; font-weight: 700; color: #fff; word-break: break-word; }
+        .detail-stats {
+            display: flex; gap: 20px; font-size: 13px; color: rgba(255,255,255,0.6);
+        }
+        .detail-stat { display: flex; align-items: center; gap: 6px; }
+        .detail-stat-value { color: #fff; font-weight: 600; }
+
+        .detail-body { flex: 1; overflow-y: auto; padding: 20px 24px; }
+
+        /* Sections */
+        .section {
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 16px; margin-bottom: 20px; overflow: hidden;
+        }
+        .section-header {
+            padding: 14px 18px; background: rgba(0,0,0,0.3);
+            font-size: 12px; font-weight: 600;
+            color: rgba(255,255,255,0.6);
+            text-transform: uppercase; letter-spacing: 1px;
+            display: flex; justify-content: space-between; align-items: center;
+        }
+        .section-icon { margin-right: 10px; font-size: 16px; }
+        .section-body { padding: 18px; }
+
+        /* Path Tree */
+        .path-tree { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+        .path-tree .tree-row { display: flex; align-items: center; padding: 4px 0; }
+        .path-tree .tree-branch { color: rgba(255,255,255,0.3); margin-right: 6px; width: 12px; }
+        .path-tree .tree-icon { margin-right: 8px; font-size: 14px; }
+        .path-tree .folder-name { color: rgba(255,255,255,0.7); }
+        .path-tree .file-highlight {
+            background: linear-gradient(90deg, rgba(102, 126, 234, 0.2) 0%, transparent 100%);
+            margin: 8px -18px 0; padding: 10px 18px;
+        }
+        .path-tree .file-name { color: #74b9ff; font-weight: 600; }
+
+        .copy-btn {
+            background: rgba(255,255,255,0.1); border: none; color: #74b9ff;
+            cursor: pointer; font: inherit; font-size: 11px; padding: 6px 12px;
+            border-radius: 6px; transition: all 0.2s;
+        }
+        .copy-btn:hover { background: rgba(255,255,255,0.2); }
+
+        /* Action Cards */
+        .action-card {
+            background: rgba(0,0,0,0.3);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 12px; margin-bottom: 12px; overflow: hidden;
+        }
+        .action-card.current { border-color: #00b894; box-shadow: 0 0 0 1px rgba(0, 184, 148, 0.3); }
+        .action-card-header {
+            padding: 14px 16px; display: flex;
+            justify-content: space-between; align-items: center;
+        }
+        .action-name-box { display: flex; align-items: center; gap: 10px; }
+        .action-current-badge {
+            background: linear-gradient(135deg, #00b894 0%, #00cec9 100%);
+            color: #000; padding: 3px 8px; border-radius: 4px;
+            font-size: 10px; font-weight: 700;
+        }
+        .action-name-text { font-weight: 600; color: #ffeaa7; font-size: 14px; }
+        .action-count-badge {
+            background: rgba(255,255,255,0.1); color: rgba(255,255,255,0.7);
+            padding: 4px 12px; border-radius: 10px; font-size: 11px; font-weight: 600;
+        }
+        .action-enum-row {
+            padding: 10px 16px; background: rgba(0,0,0,0.2);
+            border-top: 1px solid rgba(255,255,255,0.05);
+        }
+        .action-enum {
+            font-family: 'JetBrains Mono', monospace; font-size: 11px;
+            color: #81ecec; background: rgba(129, 236, 236, 0.1);
+            padding: 8px 12px; border-radius: 6px; display: inline-block;
+        }
+        .action-params {
+            padding: 12px 16px; background: rgba(0,0,0,0.2);
+            border-top: 1px solid rgba(255,255,255,0.05);
+        }
+        .action-params-label {
+            font-size: 10px; color: rgba(255,255,255,0.5);
+            margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px;
+        }
+        .action-params-value {
+            font-family: 'JetBrains Mono', monospace; font-size: 11px;
+            color: #dfe6e9; background: rgba(0,0,0,0.3);
+            padding: 12px; border-radius: 8px;
+            white-space: pre-wrap; word-break: break-all;
+            max-height: 150px; overflow-y: auto;
+        }
+
+        /* ===== FLOW VIEW ===== */
+        .flow-container { padding: 20px; }
+        .flow-item {
+            display: flex; margin-bottom: 0; position: relative;
+        }
+        .flow-time-col {
+            width: 60px; padding: 14px 0; text-align: right; padding-right: 16px;
+        }
+        .flow-time {
+            font-size: 10px; color: rgba(255,255,255,0.4);
+            font-family: 'JetBrains Mono', monospace;
+        }
+        .flow-line-col {
+            width: 30px; display: flex; flex-direction: column;
+            align-items: center; position: relative;
+        }
+        .flow-dot {
+            width: 12px; height: 12px; border-radius: 50%;
+            background: rgba(255,255,255,0.2);
+            border: 3px solid rgba(0,0,0,0.5);
+            z-index: 1; margin-top: 16px;
+        }
+        .flow-item.recent .flow-dot {
+            background: #00b894; box-shadow: 0 0 10px rgba(0, 184, 148, 0.5);
+        }
+        .flow-connector {
+            width: 2px; flex: 1; background: rgba(255,255,255,0.1); margin-top: -2px;
+        }
+        .flow-item:last-child .flow-connector { display: none; }
+        .flow-content-col { flex: 1; padding: 10px 0 10px 12px; }
+        .flow-card {
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 10px; padding: 12px 14px;
+        }
+        .flow-item.recent .flow-card {
+            border-color: rgba(0, 184, 148, 0.3);
+            background: rgba(0, 184, 148, 0.1);
+        }
+        .flow-actor-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+        .flow-actor-dot { width: 8px; height: 8px; border-radius: 50%; }
+        .flow-actor-name { font-weight: 600; font-size: 11px; color: #fff; }
+        .flow-action-name { font-size: 13px; color: #ffeaa7; font-weight: 500; }
+        .flow-params {
+            font-family: 'JetBrains Mono', monospace; font-size: 10px;
+            color: rgba(255,255,255,0.6); background: rgba(0,0,0,0.3);
+            padding: 8px 10px; border-radius: 6px; margin-top: 8px;
+            white-space: pre-wrap; max-height: 60px; overflow-y: auto;
+        }
+
+        .empty { text-align: center; padding: 80px 40px; color: rgba(255,255,255,0.4); }
+        .empty-icon { font-size: 64px; margin-bottom: 20px; }
+        .empty-title { font-size: 18px; color: rgba(255,255,255,0.7); margin-bottom: 8px; font-weight: 600; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="brand">
+            <span class="logo">🎰</span>
+            <span class="title">Flow Tracer</span>
+        </div>
+        <span class="game-badge" id="gameBadge">\${gameName}</span>
+        <span id="statusPill" class="status-pill recording">
+            <span class="status-dot"></span>Recording
+        </span>
+        <div class="view-switcher">
+            <button id="actorsBtn" class="view-btn active">🌳 Tree</button>
+            <button id="flowBtn" class="view-btn">📜 Flow</button>
+        </div>
+        <input id="searchBox" class="search-box" placeholder="Search...">
+        <div style="flex:1"></div>
+        <button id="pauseBtn" class="header-btn">⏸️ Pause</button>
+        <button id="clearBtn" class="header-btn danger">🗑️ Clear</button>
+    </div>
+
+    <div class="main">
+        <div class="tree-panel" id="treePanel">
+            <div class="panel-header">
+                <span>Explorer</span>
+                <span class="panel-count" id="itemCount">0</span>
+            </div>
+            <div class="tree-container" id="treeContainer"></div>
+        </div>
+
+        <div class="right-panel" id="rightPanel">
+            <div id="detailHeader" style="display:none;">
+                <div class="detail-header">
+                    <div class="detail-title-row">
+                        <div class="detail-color-bar" id="detailColorBar"></div>
+                        <div class="detail-title" id="detailTitle"></div>
+                    </div>
+                    <div class="detail-stats" id="detailStats"></div>
+                </div>
+            </div>
+            <div class="detail-body" id="detailBody">
+                <div class="empty">
+                    <div class="empty-icon">🌳</div>
+                    <div class="empty-title">Select an actor</div>
+                    <div class="empty-subtitle">Click on an actor in the tree to view details</div>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>\`);
+
+            tracerWindow.document.close();
+            setTimeout(() => { setupWindowEvents(); startRefresh(); }, 100);
+        }
+
+        function setupWindowEvents() {
+            if (!tracerWindow || tracerWindow.closed) return;
+            const doc = tracerWindow.document;
+
+            doc.getElementById('pauseBtn').onclick = () => {
+                isPaused = !isPaused;
+                doc.getElementById('pauseBtn').textContent = isPaused ? '▶️ Resume' : '⏸️ Pause';
+                doc.getElementById('statusPill').innerHTML = isPaused
+                    ? '<span class="status-dot"></span> Paused'
+                    : '<span class="status-dot"></span> Recording';
+                doc.getElementById('statusPill').className = 'status-pill ' + (isPaused ? 'paused' : 'recording');
+            };
+
+            doc.getElementById('clearBtn').onclick = () => {
+                actorData.clear(); actorHistory.clear(); actionFlow.length = 0;
+                selectedActor = null; clearHighlight(); renderContent();
+            };
+
+            doc.getElementById('searchBox').oninput = () => renderContent();
+
+            doc.getElementById('actorsBtn').onclick = () => {
+                currentView = 'actors';
+                doc.getElementById('actorsBtn').classList.add('active');
+                doc.getElementById('flowBtn').classList.remove('active');
+                doc.getElementById('treePanel').style.display = 'flex';
+                renderContent();
+            };
+
+            doc.getElementById('flowBtn').onclick = () => {
+                currentView = 'flow';
+                doc.getElementById('flowBtn').classList.add('active');
+                doc.getElementById('actorsBtn').classList.remove('active');
+                doc.getElementById('treePanel').style.display = 'none';
+                renderContent();
+            };
+        }
+
+        function startRefresh() {
+            if (refreshInterval) clearInterval(refreshInterval);
+            refreshInterval = setInterval(() => {
+                if (!tracerWindow || tracerWindow.closed) { clearInterval(refreshInterval); clearHighlight(); return; }
+                updateHighlight();
+            }, 100);
+        }
+
+        function renderContent() {
+            if (currentView === 'flow') {
+                renderFlowView();
+            } else {
+                renderTreeView();
+                renderActorDetails();
+            }
+        }
+
+        function renderTreeView() {
+            if (!tracerWindow || tracerWindow.closed) return;
+            const doc = tracerWindow.document;
+            const container = doc.getElementById('treeContainer');
+            const search = doc.getElementById('searchBox').value.toLowerCase();
+
+            const tree = buildActorTree();
+            const folders = Object.values(tree.children)
+                .filter(f => f.actors.length > 0)
+                .filter(f => !search || f.actors.some(a => a.name.toLowerCase().includes(search)))
+                .sort((a, b) => {
+                    const aMax = Math.max(...a.actors.map(x => x.data.lastTime));
+                    const bMax = Math.max(...b.actors.map(x => x.data.lastTime));
+                    return bMax - aMax;
+                });
+
+            const totalActors = folders.reduce((sum, f) => sum + f.actors.length, 0);
+            doc.getElementById('itemCount').textContent = totalActors;
+
+            if (folders.length === 0) {
+                container.innerHTML = '<div class="empty"><div class="empty-icon">⏳</div><div class="empty-title">Waiting...</div></div>';
+                return;
+            }
+
+            const folderIcons = {
+                'game-scene': '🎮', 'symbols': '💎', 'coins': '🪙', 'stickies': '📌',
+                'win': '🏆', 'splash-screen': '🎬', 'logo': '🏷️', 'background': '🖼️',
+                'particles': '✨', 'dialog-box': '💬', 'pay-lines': '📊', 'postpone': '⏸️',
+                'core': '⚙️', 'collectors': '🧲', 'other': '📁'
+            };
+
+            const now = Date.now();
+
+            let html = '';
+            folders.forEach(folder => {
+                const isExpanded = expandedFolders.has(folder.name);
+                const folderActors = search
+                    ? folder.actors.filter(a => a.name.toLowerCase().includes(search))
+                    : folder.actors;
+
+                html += \`
+                    <div class="tree-folder \${isExpanded ? 'expanded' : ''}" data-folder="\${folder.name}">
+                        <div class="tree-folder-header">
+                            <span class="tree-chevron">▶</span>
+                            <span class="tree-folder-icon">\${folderIcons[folder.name] || '📁'}</span>
+                            <span class="tree-folder-name">\${folder.name}</span>
+                            <span class="tree-folder-badge">\${folderActors.length}</span>
+                        </div>
+                        <div class="tree-folder-children">
+                \`;
+
+                folderActors.forEach(actor => {
+                    const isRecent = now - actor.data.lastTime < 500;
+                    const isSelected = selectedActor === actor.name;
+                    const shortAction = formatActionName(actor.data.action);
+
+                    html += \`
+                        <div class="tree-actor \${isSelected ? 'selected' : ''} \${isRecent ? 'flash' : ''}"
+                             data-actor="\${actor.name}" title="\${actor.name}">
+                            <span class="tree-actor-icon">📄</span>
+                            <span class="tree-actor-name">\${actor.displayName}</span>
+                            <span class="tree-actor-action">\${shortAction}</span>
+                            <span class="tree-actor-calls">×\${actor.data.totalCalls}</span>
+                        </div>
+                    \`;
+                });
+
+                html += '</div></div>';
+            });
+
+            container.innerHTML = html;
+
+            // Event listeners
+            container.querySelectorAll('.tree-folder-header').forEach(header => {
+                header.onclick = (e) => {
+                    const folder = header.parentElement;
+                    const folderName = folder.dataset.folder;
+                    folder.classList.toggle('expanded');
+                    if (folder.classList.contains('expanded')) {
+                        expandedFolders.add(folderName);
+                    } else {
+                        expandedFolders.delete(folderName);
+                    }
+                };
+            });
+
+            container.querySelectorAll('.tree-actor').forEach(item => {
+                item.onclick = (e) => {
+                    e.stopPropagation();
+                    const name = item.dataset.actor;
+                    selectedActor = selectedActor === name ? null : name;
+                    renderTreeView();
+                    renderActorDetails();
+                    updateHighlight();
+                };
+            });
+        }
+
+        function renderFlowView() {
+            if (!tracerWindow || tracerWindow.closed) return;
+            const doc = tracerWindow.document;
+            const detailBody = doc.getElementById('detailBody');
+            const search = doc.getElementById('searchBox').value.toLowerCase();
+
+            doc.getElementById('detailHeader').style.display = 'none';
+            doc.getElementById('itemCount').textContent = actionFlow.length;
+
+            const filtered = actionFlow.filter(f =>
+                !search || f.actor.toLowerCase().includes(search) || f.action.toLowerCase().includes(search)
+            );
+
+            if (filtered.length === 0) {
+                detailBody.innerHTML = '<div class="empty"><div class="empty-icon">📜</div><div class="empty-title">No actions yet</div></div>';
+                return;
+            }
+
+            const now = Date.now();
+            let html = '<div class="flow-container">';
+
+            filtered.slice(0, 50).forEach((f, idx) => {
+                const isRecent = now - f.time < 3000;
+                const color = getActorColor(f.actor);
+                const params = formatParams(f.params);
+
+                html += \`
+                    <div class="flow-item \${isRecent ? 'recent' : ''}">
+                        <div class="flow-time-col"><div class="flow-time">\${getRelativeTime(f.time)}</div></div>
+                        <div class="flow-line-col">
+                            <div class="flow-dot"></div>
+                            <div class="flow-connector"></div>
+                        </div>
+                        <div class="flow-content-col">
+                            <div class="flow-card">
+                                <div class="flow-actor-row">
+                                    <div class="flow-actor-dot" style="background:\${color}"></div>
+                                    <div class="flow-actor-name">\${f.actor.replace(/^actor-/, '')}</div>
+                                </div>
+                                <div class="flow-action-name">\${formatActionName(f.action)}</div>
+                                \${params ? '<div class="flow-params">' + params + '</div>' : ''}
+                            </div>
+                        </div>
+                    </div>
+                \`;
+            });
+
+            html += '</div>';
+            detailBody.innerHTML = html;
+        }
+
+        function renderActorDetails() {
+            if (!tracerWindow || tracerWindow.closed || currentView === 'flow') return;
+            const doc = tracerWindow.document;
+            const header = doc.getElementById('detailHeader');
+            const body = doc.getElementById('detailBody');
+
+            if (!selectedActor || !actorData.has(selectedActor)) {
+                header.style.display = 'none';
+                body.innerHTML = '<div class="empty"><div class="empty-icon">🌳</div><div class="empty-title">Select an actor</div><div class="empty-subtitle">Click on an actor in the tree</div></div>';
+                return;
+            }
+
+            const data = actorData.get(selectedActor);
+            const history = actorHistory.get(selectedActor) || [];
+            const pathInfo = getActorPathInfo(selectedActor);
+            const enumName = getEnumName(selectedActor);
+            const color = getActorColor(selectedActor);
+
+            header.style.display = 'block';
+            doc.getElementById('detailColorBar').style.background = color;
+            doc.getElementById('detailTitle').textContent = selectedActor;
+            doc.getElementById('detailStats').innerHTML = \`
+                <div class="detail-stat">📞 <span class="detail-stat-value">\${data.totalCalls}</span> calls</div>
+                <div class="detail-stat">🎬 <span class="detail-stat-value">\${history.length}</span> unique</div>
+            \`;
+
+            const actionsHtml = history.map((h, idx) => {
+                const enumConst = actionToEnum(h.action);
+                const fullEnumRef = enumName + '.' + enumConst;
+                const isCurrent = idx === 0;
+                const paramsJson = formatParams(h.params);
+
+                return \`
+                    <div class="action-card \${isCurrent ? 'current' : ''}">
+                        <div class="action-card-header">
+                            <div class="action-name-box">
+                                \${isCurrent ? '<span class="action-current-badge">LATEST</span>' : ''}
+                                <span class="action-name-text">\${formatActionName(h.action)}</span>
+                            </div>
+                            <span class="action-count-badge">×\${h.count}</span>
+                        </div>
+                        <div class="action-enum-row">
+                            <code class="action-enum">\${fullEnumRef}</code>
+                        </div>
+                        \${paramsJson ? \`
+                            <div class="action-params">
+                                <div class="action-params-label">Parameters</div>
+                                <div class="action-params-value">\${paramsJson}</div>
+                            </div>
+                        \` : ''}
+                    </div>
+                \`;
+            }).join('');
+
+            body.innerHTML = \`
+                <div class="section">
+                    <div class="section-header">
+                        <span><span class="section-icon">📁</span>File Location</span>
+                        <button class="copy-btn" onclick="navigator.clipboard.writeText('\${pathInfo.fullPath}');this.textContent='✓';setTimeout(()=>this.textContent='Copy',1500)">Copy</button>
+                    </div>
+                    <div class="section-body">
+                        \${generatePathTreeHTML(pathInfo)}
+                    </div>
+                </div>
+                <div class="section">
+                    <div class="section-header"><span><span class="section-icon">🎬</span>Actions</span></div>
+                    <div class="section-body" style="padding:12px;">
+                        \${actionsHtml || '<div class="empty"><div class="empty-subtitle">No actions</div></div>'}
+                    </div>
+                </div>
+            \`;
+        }
+
+        function logAction(actorName, action, params, pixiContainer) {
+            if (isPaused) return;
+            const now = Date.now();
+            const existing = actorData.get(actorName);
+
+            actorData.set(actorName, {
+                action, params, lastTime: now,
+                totalCalls: (existing?.totalCalls || 0) + 1,
+                pixiContainer: pixiContainer || existing?.pixiContainer
+            });
+
+            if (!actorHistory.has(actorName)) actorHistory.set(actorName, []);
+            const hist = actorHistory.get(actorName);
+            const existingIdx = hist.findIndex(h => h.action === action);
+            if (existingIdx >= 0) {
+                const old = hist.splice(existingIdx, 1)[0];
+                hist.unshift({ action, params, count: old.count + 1 });
+            } else {
+                hist.unshift({ action, params, count: 1 });
+            }
+            if (hist.length > 30) hist.length = 30;
+
+            actionFlow.unshift({ actor: actorName, action, time: now, params });
+            if (actionFlow.length > MAX_FLOW) actionFlow.length = MAX_FLOW;
+
+            if (tracerWindow && !tracerWindow.closed) renderContent();
+        }
+
+        function hookActor(actor, actorName) {
+            if (!actor || typeof actor.callAction !== 'function') return false;
+            if (hookedActors.has(actor)) return false;
+            const original = actor.callAction.bind(actor);
+            const pixiContainer = actor.graphicContainer?.graphic || actor.getContainer?.() || actor.container || null;
+            actor.callAction = function(action, params) {
+                const actionStr = typeof action === 'object' ? (action.type || JSON.stringify(action)) : String(action);
+                logAction(actorName, actionStr, params, pixiContainer);
+                return original(action, params);
+            };
+            hookedActors.add(actor);
+            return true;
+        }
+
+        function hookAllActors() {
+            const registry = window.ZeusPlay?.actors?.actorsRegistry;
+            if (!registry) return 0;
+            let hooked = 0;
+            registry.forEach((store, name) => {
+                const actors = store._actors || store.actors || [];
+                actors.forEach((actor, idx) => {
+                    const actorName = actors.length > 1 ? name + '[' + idx + ']' : name;
+                    if (hookActor(actor, actorName)) hooked++;
+                });
+            });
+            return hooked;
+        }
+
+        function init() {
+            if (isInitialized) return;
+            isInitialized = true;
+            hookAllActors();
+            setInterval(hookAllActors, 2000);
+        }
+
+        document.addEventListener('keydown', (e) => {
+            if (e.altKey && e.key === '6') {
+                e.preventDefault();
+                if (tracerWindow && !tracerWindow.closed) { tracerWindow.focus(); return; }
+                if (!window.ZeusPlay?.actors?.actorsRegistry) { console.log('[Flow Tracer] ⏳ Waiting...'); return; }
+                init();
+                createTracerWindow();
+            }
+        });
+
+        console.log('[Flow Tracer v16] ✅ Alt+6');
+    })();
+    `;
+    document.head.appendChild(script);
+})();
