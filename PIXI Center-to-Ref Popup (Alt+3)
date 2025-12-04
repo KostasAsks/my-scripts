@@ -1,0 +1,405 @@
+// ==UserScript==
+// @name         PIXI Center-to-Ref Popup (Alt+3)
+// @namespace    https://tampermonkey.net/
+// @version      2.3.0
+// @description  Center target to ref με βελτιωμένο UI. Alt+3 toggle. Timer freeze με setTimeout/setInterval hooks.
+// @match        https://pdev-ws.zeusplay.com/*
+// @match        https://pdev-partner-simulator.zeusplay.com/*
+// @match        http://localhost:*/*
+// @match        https://localhost:*/*
+// @match        http://127.0.0.1:*/*
+// @match        https://127.0.0.1:*/*
+// @match        http://192.168.1.39:*/*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+(() => {
+  let popup = null;
+  let doc, win;
+  let app, PointCtor, mapPoint, canvas;
+  let panel = null;
+  let state = null;
+  const baseline = new Map();
+  const movedObjects = new Map();
+  let highlightTarget = null;
+  let highlightRef = null;
+
+  const frozenObjects = new Map();
+  let timersFrozen = false;
+  let originalSetTimeout = null;
+  let originalSetInterval = null;
+  let pendingTimeouts = [];
+  let pendingIntervals = [];
+  let pixiTickerSpeed = null;
+
+  let lastClickPos = { x: 0, y: 0 };
+  let lastClickTime = 0;
+  let clickCycleIndex = 0;
+  let lastFoundObjects = [];
+  let pickMode = 't';
+
+  const GENERIC_PATTERNS = [/^Spine\d*$/i, /^Container\d*$/i, /^Sprite\d*$/i, /^SpineSprite\d*$/i, /^SpineMesh\d*$/i, /^Graphics\d*$/i, /^Mesh\d*$/i];
+  const SKIP_LABEL = /^e$/i;
+
+  const label = (o) => o?.name || o?.label || `${o?.constructor?.name || 'Obj'}${o?.uid ? `#${o.uid}` : ''}`;
+  const shouldSkipLabel = (lbl) => SKIP_LABEL.test(lbl);
+  const isInvis = (o) => o && (o.visible === false || o.worldVisible === false || o.renderable === false);
+  const isAncestor = (a, b) => { let c = b?.parent; while (c) { if (c === a) return true; c = c.parent; } return false; };
+  const ensureScale = (o) => { if (o && !o.scale) o.scale = { x: 1, y: 1 }; };
+  const $ = (sel) => panel?.querySelector(sel);
+  const isGenericName = (name) => !name || GENERIC_PATTERNS.some(p => p.test(name));
+
+  window.addEventListener('keydown', (e) => { if (e.altKey && e.key === '3') { e.preventDefault(); openPopup(); } });
+
+  function freezeObject(obj) {
+    if (!obj || frozenObjects.has(obj)) return;
+    const originalState = {};
+    if (obj.state?.timeScale !== undefined) { originalState.stateTimeScale = obj.state.timeScale; obj.state.timeScale = 0; }
+    if (obj.timeScale !== undefined) { originalState.timeScale = obj.timeScale; obj.timeScale = 0; }
+    if (typeof obj.stop === 'function' && typeof obj.play === 'function') { originalState.wasPlaying = obj.playing; obj.stop(); }
+    if (obj.autoUpdate !== undefined) { originalState.autoUpdate = obj.autoUpdate; obj.autoUpdate = false; }
+    if (typeof obj.update === 'function' && !originalState.stateTimeScale) { originalState.updateFn = obj.update; obj.update = function() {}; }
+    const frozenChildren = [];
+    function freezeChildren(node) {
+      if (node.state?.timeScale !== undefined && node !== obj) { frozenChildren.push({ node, timeScale: node.state.timeScale }); node.state.timeScale = 0; }
+      (node.children || []).forEach(freezeChildren);
+    }
+    freezeChildren(obj);
+    if (frozenChildren.length > 0) originalState.frozenChildren = frozenChildren;
+    frozenObjects.set(obj, originalState);
+  }
+
+  function unfreezeObject(obj) {
+    if (!obj || !frozenObjects.has(obj)) return;
+    const originalState = frozenObjects.get(obj);
+    if (originalState.stateTimeScale !== undefined && obj.state) obj.state.timeScale = originalState.stateTimeScale;
+    if (originalState.timeScale !== undefined) obj.timeScale = originalState.timeScale;
+    if (originalState.wasPlaying && typeof obj.play === 'function') obj.play();
+    if (originalState.autoUpdate !== undefined) obj.autoUpdate = originalState.autoUpdate;
+    if (originalState.updateFn) obj.update = originalState.updateFn;
+    if (originalState.frozenChildren) originalState.frozenChildren.forEach(({ node, timeScale }) => { if (node.state) node.state.timeScale = timeScale; });
+    frozenObjects.delete(obj);
+  }
+
+  function freezeTimers() {
+    if (timersFrozen) return;
+    timersFrozen = true;
+    if (!originalSetTimeout) {
+      originalSetTimeout = window.setTimeout;
+      window.setTimeout = function(fn, delay, ...args) {
+        if (timersFrozen) { pendingTimeouts.push({ fn, delay, args }); return -1; }
+        return originalSetTimeout.call(window, fn, delay, ...args);
+      };
+    }
+    if (!originalSetInterval) {
+      originalSetInterval = window.setInterval;
+      window.setInterval = function(fn, delay, ...args) {
+        if (timersFrozen) { pendingIntervals.push({ fn, delay, args }); return -1; }
+        return originalSetInterval.call(window, fn, delay, ...args);
+      };
+    }
+    if (window.__PIXI_APP__?.ticker) { pixiTickerSpeed = window.__PIXI_APP__.ticker.speed; window.__PIXI_APP__.ticker.speed = 0; }
+    if (window.gsap?.globalTimeline) window.gsap.globalTimeline.timeScale(0);
+    updateTimerButton();
+  }
+
+  function unfreezeTimers() {
+    if (!timersFrozen) return;
+    timersFrozen = false;
+    if (window.__PIXI_APP__?.ticker && pixiTickerSpeed !== null) window.__PIXI_APP__.ticker.speed = pixiTickerSpeed;
+    if (window.gsap?.globalTimeline) window.gsap.globalTimeline.timeScale(1);
+    for (const p of pendingTimeouts) originalSetTimeout.call(window, p.fn, p.delay, ...p.args);
+    for (const p of pendingIntervals) originalSetInterval.call(window, p.fn, p.delay, ...p.args);
+    pendingTimeouts = [];
+    pendingIntervals = [];
+    pixiTickerSpeed = null;
+    updateTimerButton();
+  }
+
+  function updateTimerButton() {
+    if (!panel) return;
+    const btn = $('#btn-timer');
+    if (!btn) return;
+    btn.textContent = timersFrozen ? '▶ Timers' : '⏱ Timers';
+    btn.classList.toggle('frozen', timersFrozen);
+  }
+
+  function updateFreezeButtons() {
+    if (!panel || !state) return;
+    const tObj = state.tIdx >= 0 ? state.nodes[state.tIdx]?.obj : null;
+    const rObj = state.rIdx >= 0 ? state.nodes[state.rIdx]?.obj : null;
+    const btnFreezeT = $('#btn-freeze-t'), btnFreezeR = $('#btn-freeze-r');
+    if (btnFreezeT) { btnFreezeT.textContent = (tObj && frozenObjects.has(tObj)) ? '▶' : '❄'; btnFreezeT.classList.toggle('frozen', tObj && frozenObjects.has(tObj)); }
+    if (btnFreezeR) { btnFreezeR.textContent = (rObj && frozenObjects.has(rObj)) ? '▶' : '❄'; btnFreezeR.classList.toggle('frozen', rObj && frozenObjects.has(rObj)); }
+  }
+
+  function createHighlight(id, color) {
+    let el = document.getElementById(id);
+    if (el) return el;
+    const div = document.createElement("div");
+    div.id = id;
+    Object.assign(div.style, { position: "fixed", border: `3px solid ${color}`, background: `${color}15`, pointerEvents: "none", zIndex: "2147483645", display: "none", boxSizing: "border-box" });
+    const lbl = document.createElement("div");
+    Object.assign(lbl.style, { position: "absolute", bottom: "100%", left: "-3px", background: color, color: "#000", padding: "2px 8px", fontSize: "11px", fontFamily: "system-ui", fontWeight: "600", whiteSpace: "nowrap", borderRadius: "4px 4px 0 0", maxWidth: "250px", overflow: "hidden", textOverflow: "ellipsis" });
+    const info = document.createElement("div");
+    Object.assign(info.style, { position: "absolute", top: "100%", left: "-3px", background: "rgba(0,0,0,0.8)", color: color, padding: "2px 6px", fontSize: "10px", fontFamily: "monospace", whiteSpace: "nowrap", borderRadius: "0 0 4px 4px", display: "none" });
+    div.appendChild(lbl); div.appendChild(info); document.body.appendChild(div);
+    return div;
+  }
+
+  function updateHighlightEl(el, obj, bounds, labelText, cycleInfo = null) {
+    if (!obj || !bounds || !canvas) { if (el) el.style.display = "none"; return; }
+    try {
+      const rect = canvas.getBoundingClientRect();
+      const sx = rect.width / (app.renderer?.width || canvas.width), sy = rect.height / (app.renderer?.height || canvas.height);
+      Object.assign(el.style, { left: `${rect.left + bounds.x * sx}px`, top: `${rect.top + bounds.y * sy}px`, width: `${bounds.width * sx}px`, height: `${bounds.height * sy}px`, display: "block" });
+      const frozenIcon = frozenObjects.has(obj) ? ' ❄' : '';
+      if (el.children[0]) el.children[0].textContent = labelText + frozenIcon;
+      if (el.children[1]) { if (cycleInfo) { el.children[1].textContent = cycleInfo; el.children[1].style.display = "block"; } else el.children[1].style.display = "none"; }
+    } catch { if (el) el.style.display = "none"; }
+  }
+
+  function updateHighlights() {
+    if (!state) return;
+    const tObj = state.tIdx >= 0 ? state.nodes[state.tIdx]?.obj : null;
+    const rObj = state.rIdx >= 0 ? state.nodes[state.rIdx]?.obj : null;
+    if (!highlightTarget) highlightTarget = createHighlight("__ctr_hl_t__", "#00BFFF");
+    if (!highlightRef) highlightRef = createHighlight("__ctr_hl_r__", "#FF9800");
+    const tCycleInfo = (pickMode === 't' && lastFoundObjects.length > 1) ? `${clickCycleIndex + 1}/${lastFoundObjects.length} · Click cycle · Shift=parent` : null;
+    const rCycleInfo = (pickMode === 'r' && lastFoundObjects.length > 1) ? `${clickCycleIndex + 1}/${lastFoundObjects.length} · Click cycle · Shift=parent` : null;
+    updateHighlightEl(highlightTarget, tObj, state.snapT, tObj ? label(tObj) : "", tCycleInfo);
+    updateHighlightEl(highlightRef, rObj, state.snapR, rObj ? label(rObj) : "", rCycleInfo);
+  }
+
+  function clearHighlights() { if (highlightTarget) highlightTarget.style.display = "none"; if (highlightRef) highlightRef.style.display = "none"; }
+  function updateAfterRender() { requestAnimationFrame(() => requestAnimationFrame(() => { snapTarget(); snapRef(); updateInfo(); updateHighlights(); updateFreezeButtons(); })); }
+  function updatePickModeUI() { if (!panel) return; $('#label-t')?.classList.toggle('active', pickMode === 't'); $('#label-r')?.classList.toggle('active', pickMode === 'r'); }
+
+  function openPopup() {
+    try {
+      if (popup && !popup.closed) { popup.focus(); return; }
+      popup = window.open('', 'pixi-ctr-popup', 'width=500,height=820,resizable=yes,scrollbars=yes');
+      if (!popup) return;
+      popup.focus(); doc = popup.document; win = popup; panel = null;
+      if (!initCore()) { doc.body.innerHTML = '<div style="padding:20px;color:#f55;font:14px system-ui;">PIXI app not found.</div>'; return; }
+      injectStyle(); buildPanel();
+      state = { nodes: collectAll(app.stage), openPaths: new Set(['stage']), tIdx: -1, rIdx: -1, snapT: null, snapR: null };
+      snapshotAll(state.nodes); renderTrees(); initInputs(); attachHandlers(); updateTimerButton();
+      win.addEventListener('beforeunload', () => { clearHighlights(); popup = null; panel = null; state = null; });
+      if (state.nodes.length) select(0, 't', true);
+    } catch (err) { console.error('CTR Error:', err); }
+  }
+
+  function initCore() {
+    app = window.__PIXI_APP__ || document.querySelector('canvas')?.__PIXI_APP__ || window.pixiApp || window.app || window.game?.app || window.gameApp;
+    if (!app?.stage) return false;
+    const inter = app.renderer?.plugins?.interaction || app.renderer?.events || app.renderer?.interaction;
+    mapPoint = inter?.mapPositionToPoint?.bind(inter);
+    PointCtor = inter?.mouse?.global?.constructor || inter?.pointer?.global?.constructor || (window.PIXI && PIXI.Point);
+    if (!PointCtor || !mapPoint) return false;
+    canvas = app.view;
+    return true;
+  }
+
+  function collectAll(node, path = 'stage', list = []) {
+    if (node !== app.stage) { const lbl = label(node); if (!shouldSkipLabel(lbl)) list.push({ obj: node, path }); }
+    (node.children || []).forEach((c) => { const childLabel = label(c); collectAll(c, shouldSkipLabel(childLabel) ? path : `${path}/${childLabel}`, list); });
+    return list;
+  }
+
+  function worldBounds(obj, skip = null) {
+    try { const b = obj.getBounds?.(true); if (b && isFinite(b.x) && isFinite(b.y) && b.width && b.height) return b; } catch {}
+    if (obj.children?.length) {
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity, any = false;
+      for (const c of obj.children) { if (skip && (c === skip || isAncestor(c, skip))) continue; const cb = worldBounds(c, skip); if (!cb) continue; any = true; minX = Math.min(minX, cb.x); minY = Math.min(minY, cb.y); maxX = Math.max(maxX, cb.x + cb.width); maxY = Math.max(maxY, cb.y + cb.height); }
+      if (any) return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+    }
+    return null;
+  }
+
+  function snapshotAll(nodes) { baseline.clear(); movedObjects.clear(); nodes.forEach((n) => { const o = n.obj; baseline.set(o, { x: o.x || 0, y: o.y || 0, sx: o.scale?.x ?? 1, sy: o.scale?.y ?? 1 }); }); }
+
+  function trackMove(obj) {
+    if (!obj) return;
+    const base = baseline.get(obj);
+    if (!base) return;
+    if (!movedObjects.has(obj)) movedObjects.set(obj, { name: label(obj), originalX: base.x, originalY: base.y, originalSX: base.sx, originalSY: base.sy });
+    const data = movedObjects.get(obj);
+    data.x = obj.x || 0; data.y = obj.y || 0; data.sx = obj.scale?.x ?? 1; data.sy = obj.scale?.y ?? 1;
+    updateMovedCount();
+  }
+
+  function updateMovedCount() { if (!panel) return; const btn = $('#btn-copy'); if (btn) btn.textContent = movedObjects.size > 0 ? `📋 Copy Moved (${movedObjects.size})` : '📋 Copy Moved'; }
+
+  function injectStyle() {
+    const style = doc.createElement('style');
+    style.textContent = `*{box-sizing:border-box;margin:0;padding:0}body{background:#1a1a1a;color:#e0e0e0;font:13px system-ui,sans-serif}.panel{display:flex;flex-direction:column;height:100vh;padding:12px;gap:10px}.header{display:flex;justify-content:space-between;align-items:center;padding-bottom:8px;border-bottom:1px solid #333}.header h1{font-size:15px;color:#00BFFF}.header-btns{display:flex;gap:6px}.columns{display:flex;gap:12px;flex:1;min-height:0}.col{flex:1;display:flex;flex-direction:column;gap:6px;min-width:0}.col-header{display:flex;gap:4px;align-items:center}.col-label{flex:1;font-size:11px;font-weight:600;padding:5px 8px;border-radius:4px;cursor:pointer;text-align:center;transition:all .15s}.col-label.target{color:#00BFFF;background:rgba(0,191,255,0.1);border:2px solid #333}.col-label.target.active{border-color:#00BFFF;background:rgba(0,191,255,0.25)}.col-label.ref{color:#FF9800;background:rgba(255,152,0,0.1);border:2px solid #333}.col-label.ref.active{border-color:#FF9800;background:rgba(255,152,0,0.25)}.freeze-btn{padding:5px 8px;background:#2196F3;border:none;color:#fff;border-radius:4px;cursor:pointer;font-size:11px}.freeze-btn.frozen{background:#FF9800}.freeze-btn:hover{opacity:0.9}.tree{flex:1;background:#252525;border:1px solid #333;border-radius:6px;padding:6px;overflow:auto;font-size:11px;min-height:80px}.tree-item{padding:2px 4px;cursor:pointer;white-space:nowrap;border-radius:4px;overflow:hidden;text-overflow:ellipsis}.tree-item:hover{background:#333}.tree-item.sel-t{background:#00BFFF;color:#000;font-weight:600}.tree-item.sel-r{background:#FF9800;color:#000;font-weight:600}.tree-item.invis{opacity:0.4;font-style:italic}.tree-item.moved{border-left:3px solid #4CAF50}.tree-item.frozen{border-right:3px solid #2196F3}.arrow{display:inline-block;width:14px;color:#888;cursor:pointer}.arrow:hover{color:#fff}.info{background:#252525;border:1px solid #333;border-radius:6px;padding:6px;font-size:10px}.info div{padding:1px 0}.info span{color:#00BFFF;font-family:monospace}.transforms{display:grid;grid-template-columns:1fr 1fr;gap:4px}.input-group{display:flex;align-items:center;gap:3px}.input-group label{width:20px;font-size:10px;color:#888;font-weight:600}.input-group input{flex:1;background:#333;border:1px solid #444;border-radius:4px;padding:4px;color:#fff;font:11px monospace;min-width:0}.scrub{padding:4px 6px;background:#444;border-radius:4px;cursor:ns-resize;user-select:none;font-size:10px;color:#888}.scrub:hover{background:#555;color:#fff}.scrub:active{background:#00BFFF;color:#000}.deltas{background:#252525;border:1px solid #333;border-radius:6px;padding:10px}.deltas-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;text-align:center}.delta-item .lbl{font-size:9px;color:#888}.delta-item .val{font:600 14px monospace;color:#00BFFF}.delta-item .val.zero{color:#4caf50}.buttons{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}.btn{padding:8px;border:none;border-radius:6px;font:600 11px system-ui;cursor:pointer}.btn-primary{background:#00BFFF;color:#000}.btn-primary:hover{background:#33ccff}.btn-secondary{background:#333;color:#fff;border:1px solid #555}.btn-secondary:hover{background:#444}.btn-secondary.copied{background:#4CAF50;border-color:#4CAF50}.btn-timer{background:#2196F3;color:#fff}.btn-timer.frozen{background:#FF9800}.btn-copy{grid-column:span 2}.footer{font-size:9px;color:#666;text-align:center;padding-top:6px;border-top:1px solid #333;line-height:1.4}.footer .key{background:#333;padding:1px 4px;border-radius:3px;color:#fff}.pick-indicator{font-size:10px;padding:2px 6px;border-radius:3px}.pick-indicator.target{background:#00BFFF;color:#000}.pick-indicator.ref{background:#FF9800;color:#000}`;
+    doc.head.appendChild(style);
+  }
+
+  function buildPanel() {
+    doc.body.innerHTML = '';
+    panel = doc.createElement('div');
+    panel.className = 'panel';
+    panel.innerHTML = `<div class="header"><h1>⊕ Center-to-Ref</h1><div class="header-btns"><span class="pick-indicator ${pickMode === 't' ? 'target' : 'ref'}" id="pickIndicator">Pick: ${pickMode === 't' ? 'Target' : 'Ref'}</span></div></div><div class="columns"><div class="col"><div class="col-header"><div class="col-label target active" id="label-t">▶ Target</div><button class="freeze-btn" id="btn-freeze-t" title="Freeze">❄</button></div><div id="tree-t" class="tree"></div><div class="info"><div>Name: <span id="name-t">—</span></div><div>Pos: <span id="pos-t">—</span></div></div><div class="transforms"><div class="input-group"><label>X</label><input id="tx" type="number" step="1"><span class="scrub" data-axis="tx">↕</span></div><div class="input-group"><label>Y</label><input id="ty" type="number" step="1"><span class="scrub" data-axis="ty">↕</span></div><div class="input-group"><label>SX</label><input id="tsx" type="number" step="0.01"><span class="scrub" data-axis="tsx">↕</span></div><div class="input-group"><label>SY</label><input id="tsy" type="number" step="0.01"><span class="scrub" data-axis="tsy">↕</span></div></div></div><div class="col"><div class="col-header"><div class="col-label ref" id="label-r">◆ Reference</div><button class="freeze-btn" id="btn-freeze-r" title="Freeze">❄</button></div><div id="tree-r" class="tree"></div><div class="info"><div>Name: <span id="name-r">—</span></div><div>Pos: <span id="pos-r">—</span></div></div><div class="transforms"><div class="input-group"><label>X</label><input id="rx" type="number" step="1"><span class="scrub" data-axis="rx">↕</span></div><div class="input-group"><label>Y</label><input id="ry" type="number" step="1"><span class="scrub" data-axis="ry">↕</span></div><div class="input-group"><label>SX</label><input id="rsx" type="number" step="0.01"><span class="scrub" data-axis="rsx">↕</span></div><div class="input-group"><label>SY</label><input id="rsy" type="number" step="0.01"><span class="scrub" data-axis="rsy">↕</span></div></div></div></div><div class="deltas"><div class="deltas-grid"><div class="delta-item"><div class="lbl">ΔX</div><div id="dx" class="val">0</div></div><div class="delta-item"><div class="lbl">ΔY</div><div id="dy" class="val">0</div></div><div class="delta-item"><div class="lbl">L</div><div id="dl" class="val">0</div></div><div class="delta-item"><div class="lbl">R</div><div id="dr" class="val">0</div></div></div></div><div class="buttons"><button id="btn-cx" class="btn btn-primary">Center X</button><button id="btn-cxy" class="btn btn-primary">Center XY</button><button id="btn-cy" class="btn btn-primary">Center Y</button><button id="btn-timer" class="btn btn-timer">⏱ Timers</button><button id="btn-copy" class="btn btn-secondary btn-copy">📋 Copy Moved</button></div><div class="footer"><span class="key">Click label</span> pick mode · <span class="key">Click canvas</span> select · <span class="key">Shift</span> parent · <span class="key">Alt+3</span></div>`;
+    doc.body.appendChild(panel);
+  }
+
+  function buildTree() {
+    const root = { label: 'stage', path: 'stage', children: new Map(), idx: null };
+    state.nodes.forEach((n, i) => { const segs = n.path.split('/').slice(1); let cur = root, acc = 'stage'; segs.forEach((s, si) => { acc += `/${s}`; if (!cur.children.has(s)) cur.children.set(s, { label: s, path: acc, children: new Map(), idx: null }); cur = cur.children.get(s); if (si === segs.length - 1) cur.idx = i; }); });
+    return root;
+  }
+
+  function renderTrees() { renderTree($('#tree-t'), 't'); renderTree($('#tree-r'), 'r'); }
+
+  function renderTree(el, kind) {
+    if (!el) return;
+    el.innerHTML = '';
+    const make = (node, depth = 0) => {
+      const opened = state.openPaths.has(node.path);
+      const frag = doc.createDocumentFragment();
+      if (node.path !== 'stage') {
+        const div = doc.createElement('div'); div.className = 'tree-item'; div.style.paddingLeft = `${depth * 10}px`;
+        if (node.idx != null) {
+          if (kind === 't' && node.idx === state.tIdx) div.classList.add('sel-t');
+          if (kind === 'r' && node.idx === state.rIdx) div.classList.add('sel-r');
+          const obj = state.nodes[node.idx]?.obj;
+          if (obj && isInvis(obj)) div.classList.add('invis');
+          if (obj && movedObjects.has(obj)) div.classList.add('moved');
+          if (obj && frozenObjects.has(obj)) div.classList.add('frozen');
+        }
+        const hasChildren = node.children.size > 0;
+        const frozenIcon = node.idx != null && frozenObjects.has(state.nodes[node.idx]?.obj) ? ' ❄' : '';
+        div.innerHTML = `<span class="arrow" data-path="${node.path}">${hasChildren ? (opened ? '▾' : '▸') : '·'}</span>${node.label}${frozenIcon}`;
+        if (node.idx != null) div.dataset.idx = node.idx;
+        frag.appendChild(div);
+      }
+      if (opened || node.path === 'stage') node.children.forEach((ch) => frag.appendChild(make(ch, node.path === 'stage' ? 0 : depth + 1)));
+      return frag;
+    };
+    buildTree().children.forEach((ch) => el.appendChild(make(ch, 0)));
+    const selEl = el.querySelector(kind === 't' ? '.sel-t' : '.sel-r');
+    if (selEl) selEl.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }
+
+  function updateInfo() {
+    if (!panel || !state) return;
+    const tObj = state.tIdx >= 0 ? state.nodes[state.tIdx]?.obj : null;
+    const rObj = state.rIdx >= 0 ? state.nodes[state.rIdx]?.obj : null;
+    const frozenT = tObj && frozenObjects.has(tObj) ? ' ❄' : '', frozenR = rObj && frozenObjects.has(rObj) ? ' ❄' : '';
+    const nameT = $('#name-t'); if (nameT) nameT.textContent = tObj ? label(tObj) + frozenT : '—';
+    const nameR = $('#name-r'); if (nameR) nameR.textContent = rObj ? label(rObj) + frozenR : '—';
+    const posT = $('#pos-t'); if (posT) posT.textContent = tObj ? `${(tObj.x||0).toFixed(1)}, ${(tObj.y||0).toFixed(1)}` : '—';
+    const posR = $('#pos-r'); if (posR) posR.textContent = rObj ? `${(rObj.x||0).toFixed(1)}, ${(rObj.y||0).toFixed(1)}` : '—';
+    if (tObj) { $('#tx').value = (tObj.x || 0).toFixed(2); $('#ty').value = (tObj.y || 0).toFixed(2); $('#tsx').value = (tObj.scale?.x ?? 1).toFixed(3); $('#tsy').value = (tObj.scale?.y ?? 1).toFixed(3); }
+    if (rObj) { $('#rx').value = (rObj.x || 0).toFixed(2); $('#ry').value = (rObj.y || 0).toFixed(2); $('#rsx').value = (rObj.scale?.x ?? 1).toFixed(3); $('#rsy').value = (rObj.scale?.y ?? 1).toFixed(3); }
+    const setDelta = (id, val) => { const el = $('#' + id); if (!el) return; const num = parseFloat(val) || 0; el.textContent = num.toFixed(1); el.className = 'val' + (Math.abs(num) < 0.5 ? ' zero' : ''); };
+    if (state.snapT && state.snapR) { const tb = state.snapT, rb = state.snapR; setDelta('dx', (tb.x + tb.width/2) - (rb.x + rb.width/2)); setDelta('dy', (tb.y + tb.height/2) - (rb.y + rb.height/2)); setDelta('dl', tb.x - rb.x); setDelta('dr', (rb.x + rb.width) - (tb.x + tb.width)); }
+    else ['dx', 'dy', 'dl', 'dr'].forEach(id => setDelta(id, 0));
+    updateFreezeButtons();
+  }
+
+  function snapTarget() { if (!state || state.tIdx < 0) { if (state) state.snapT = null; return; } state.snapT = worldBounds(state.nodes[state.tIdx].obj); }
+  function snapRef() { if (!state || state.rIdx < 0) { if (state) state.snapR = null; return; } const r = state.nodes[state.rIdx].obj; state.snapR = worldBounds(r, (state.tIdx >= 0 && isAncestor(r, state.nodes[state.tIdx].obj)) ? state.nodes[state.tIdx].obj : null); }
+
+  function select(idx, kind, openAnc = false) {
+    if (!state) return;
+    if (kind === 't') { state.tIdx = idx; snapTarget(); } else { state.rIdx = idx; snapRef(); }
+    if (openAnc && idx >= 0 && state.nodes[idx]) { state.openPaths.clear(); state.openPaths.add('stage'); let acc = 'stage'; (state.nodes[idx].path || '').split('/').slice(1).forEach(p => { acc += `/${p}`; state.openPaths.add(acc); }); }
+    updateInfo(); updateHighlights(); renderTrees();
+  }
+
+  function setPickMode(mode) {
+    pickMode = mode; updatePickModeUI();
+    const indicator = $('#pickIndicator');
+    if (indicator) { indicator.textContent = `Pick: ${mode === 't' ? 'Target' : 'Ref'}`; indicator.className = `pick-indicator ${mode === 't' ? 'target' : 'ref'}`; }
+    lastFoundObjects = []; clickCycleIndex = 0;
+  }
+
+  function getParent(obj) { if (!obj?.parent || obj.parent === app.stage) return null; return obj.parent; }
+  function markAndSnap(obj, isTarget) { trackMove(obj); if (isTarget) snapTarget(); else snapRef(); updateAfterRender(); renderTrees(); }
+
+  function doCenter(mode) {
+    if (!state) return;
+    const tObj = state.tIdx >= 0 ? state.nodes[state.tIdx]?.obj : null, rObj = state.rIdx >= 0 ? state.nodes[state.rIdx]?.obj : null;
+    if (!(tObj && rObj)) return;
+    const tb = tObj.getBounds?.(true) || worldBounds(tObj), rb = rObj.getBounds?.(true) || worldBounds(rObj, isAncestor(rObj, tObj) ? tObj : null);
+    if (!(tb && rb)) return;
+    if (mode === 'x' || mode === 'xy') tObj.x += (rb.x + rb.width/2) - (tb.x + tb.width/2);
+    if (mode === 'y' || mode === 'xy') tObj.y += (rb.y + rb.height/2) - (tb.y + tb.height/2);
+    trackMove(tObj); updateAfterRender(); renderTrees();
+  }
+
+  function initInputs() {
+    const bind = (id, axis, step, setter) => {
+      const inp = $('#' + id); if (!inp) return;
+      inp.addEventListener('input', () => setter(Number(inp.value)));
+      const scrub = panel.querySelector(`.scrub[data-axis="${axis}"]`); if (!scrub) return;
+      let startY = 0, startVal = 0;
+      scrub.addEventListener('pointerdown', (e) => {
+        e.preventDefault(); startY = e.clientY; startVal = Number(inp.value);
+        const move = (ev) => { const nv = startVal + (startY - ev.clientY) * step; inp.value = nv.toFixed(step < 1 ? 3 : 2); setter(nv); };
+        const up = () => { win.removeEventListener('pointermove', move); win.removeEventListener('pointerup', up); };
+        win.addEventListener('pointermove', move); win.addEventListener('pointerup', up);
+      });
+    };
+    bind('tx', 'tx', 1, (v) => { if (!state || state.tIdx < 0) return; state.nodes[state.tIdx].obj.x = v; markAndSnap(state.nodes[state.tIdx].obj, true); });
+    bind('ty', 'ty', 1, (v) => { if (!state || state.tIdx < 0) return; state.nodes[state.tIdx].obj.y = v; markAndSnap(state.nodes[state.tIdx].obj, true); });
+    bind('tsx', 'tsx', 0.01, (v) => { if (!state || state.tIdx < 0) return; const o = state.nodes[state.tIdx].obj; ensureScale(o); o.scale.x = v; markAndSnap(o, true); });
+    bind('tsy', 'tsy', 0.01, (v) => { if (!state || state.tIdx < 0) return; const o = state.nodes[state.tIdx].obj; ensureScale(o); o.scale.y = v; markAndSnap(o, true); });
+    bind('rx', 'rx', 1, (v) => { if (!state || state.rIdx < 0) return; state.nodes[state.rIdx].obj.x = v; markAndSnap(state.nodes[state.rIdx].obj, false); });
+    bind('ry', 'ry', 1, (v) => { if (!state || state.rIdx < 0) return; state.nodes[state.rIdx].obj.y = v; markAndSnap(state.nodes[state.rIdx].obj, false); });
+    bind('rsx', 'rsx', 0.01, (v) => { if (!state || state.rIdx < 0) return; const o = state.nodes[state.rIdx].obj; ensureScale(o); o.scale.x = v; markAndSnap(o, false); });
+    bind('rsy', 'rsy', 0.01, (v) => { if (!state || state.rIdx < 0) return; const o = state.nodes[state.rIdx].obj; ensureScale(o); o.scale.y = v; markAndSnap(o, false); });
+  }
+
+  function attachHandlers() {
+    $('#label-t')?.addEventListener('click', () => setPickMode('t'));
+    $('#label-r')?.addEventListener('click', () => setPickMode('r'));
+    $('#btn-freeze-t')?.addEventListener('click', () => { if (!state || state.tIdx < 0) return; const obj = state.nodes[state.tIdx].obj; frozenObjects.has(obj) ? unfreezeObject(obj) : freezeObject(obj); updateFreezeButtons(); updateHighlights(); renderTrees(); });
+    $('#btn-freeze-r')?.addEventListener('click', () => { if (!state || state.rIdx < 0) return; const obj = state.nodes[state.rIdx].obj; frozenObjects.has(obj) ? unfreezeObject(obj) : freezeObject(obj); updateFreezeButtons(); updateHighlights(); renderTrees(); });
+    $('#btn-timer')?.addEventListener('click', () => { timersFrozen ? unfreezeTimers() : freezeTimers(); });
+
+    function handleTreeClick(e, kind) {
+      const arrow = e.target.closest('.arrow');
+      if (arrow?.dataset.path) { const p = arrow.dataset.path; state.openPaths.has(p) ? state.openPaths.delete(p) : state.openPaths.add(p); renderTrees(); return; }
+      const item = e.target.closest('.tree-item[data-idx]');
+      if (item) { select(Number(item.dataset.idx), kind, false); setPickMode(kind); }
+    }
+    $('#tree-t')?.addEventListener('click', (e) => handleTreeClick(e, 't'));
+    $('#tree-r')?.addEventListener('click', (e) => handleTreeClick(e, 'r'));
+    $('#btn-cx')?.addEventListener('click', () => doCenter('x'));
+    $('#btn-cy')?.addEventListener('click', () => doCenter('y'));
+    $('#btn-cxy')?.addEventListener('click', () => doCenter('xy'));
+
+    $('#btn-copy')?.addEventListener('click', function() {
+      if (movedObjects.size === 0) { alert('No objects have been moved yet!'); return; }
+      const allMoved = [];
+      movedObjects.forEach((data) => { allMoved.push({ name: data.name, x: parseFloat((data.x || 0).toFixed(2)), y: parseFloat((data.y || 0).toFixed(2)), sx: parseFloat((data.sx || 1).toFixed(3)), sy: parseFloat((data.sy || 1).toFixed(3)), deltaX: parseFloat(((data.x || 0) - data.originalX).toFixed(2)), deltaY: parseFloat(((data.y || 0) - data.originalY).toFixed(2)) }); });
+      const text = JSON.stringify(allMoved, null, 2);
+      try { const ta = doc.createElement('textarea'); ta.value = text; ta.style.cssText = 'position:fixed;opacity:0'; doc.body.appendChild(ta); ta.select(); doc.execCommand('copy'); doc.body.removeChild(ta); this.textContent = `✓ Copied ${allMoved.length}!`; this.classList.add('copied'); setTimeout(() => { updateMovedCount(); this.classList.remove('copied'); }, 1500); }
+      catch { win.prompt('Copy:', text); }
+    });
+
+    function handleCanvasPick(e) {
+      if (!state) return; e.preventDefault();
+      if (e.shiftKey) { const idx = pickMode === 't' ? state.tIdx : state.rIdx; if (idx >= 0) { const p = getParent(state.nodes[idx].obj); if (p) { const pi = state.nodes.findIndex(n => n.obj === p); if (pi >= 0) { select(pi, pickMode, true); lastFoundObjects = []; clickCycleIndex = 0; } } } return; }
+      const rect = canvas.getBoundingClientRect(), res = app.renderer?.resolution || 1;
+      const x = (e.clientX - rect.left) * (canvas.width / res) / rect.width, y = (e.clientY - rect.top) * (canvas.height / res) / rect.height;
+      const now = Date.now(), samePos = Math.abs(x - lastClickPos.x) < 10 && Math.abs(y - lastClickPos.y) < 10, quick = (now - lastClickTime) < 1000;
+      const found = [];
+      for (let i = state.nodes.length - 1; i >= 0; i--) { const obj = state.nodes[i].obj; if (!obj.worldVisible || isGenericName(label(obj))) continue; try { const b = obj.getBounds(); if (b && x >= b.x && x <= b.x + b.width && y >= b.y && y <= b.y + b.height) found.push({ obj, idx: i }); } catch {} }
+      if (found.length === 0) return;
+      found.sort((a, b) => { try { const ba = a.obj.getBounds(), bb = b.obj.getBounds(); return (ba.width * ba.height) - (bb.width * bb.height); } catch { return 0; } });
+      if (samePos && quick && found.length > 1) clickCycleIndex = (clickCycleIndex + 1) % found.length; else clickCycleIndex = 0;
+      lastClickPos = { x, y }; lastClickTime = now; lastFoundObjects = found.map(f => f.obj);
+      select(found[clickCycleIndex].idx, pickMode, true);
+    }
+    canvas?.addEventListener('click', handleCanvasPick);
+    canvas?.addEventListener('contextmenu', handleCanvasPick);
+  }
+
+  setInterval(() => { if (popup && !popup.closed && state) updateHighlights(); }, 100);
+})();
