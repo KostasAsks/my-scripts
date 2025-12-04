@@ -28,6 +28,8 @@
         let pixiApp = null;
         let highlightOverlay = null;
         const MAX_FLOW = 200;
+        const MAX_FLOW_DISPLAY = 100;
+        const MAX_RECEIVERS = 100;
 
         // Utility Functions
         function getPixiApp() {
@@ -68,8 +70,12 @@
             try {
                 const str = JSON.stringify(params, null, 2);
                 if (str === '{}' || str === '[]') return null;
+                // Limit size to prevent UI slowdown
+                if (str.length > 5000) return str.substring(0, 5000) + '\\n... (truncated)';
                 return str;
-            } catch (e) { return null; }
+            } catch (e) { 
+                return '(Error serializing params)';
+            }
         }
 
         function getActorColor(actorName) {
@@ -555,7 +561,7 @@
             const now = Date.now();
             let html = '<div class="flow-timeline">';
 
-            filtered.slice(0, 100).forEach((item, idx) => {
+            filtered.slice(0, MAX_FLOW_DISPLAY).forEach((item, idx) => {
                 const isRecent = now - item.time < 3000;
                 const color = getActorColor(item.actor);
                 const params = formatParams(item.params || item.state);
@@ -887,14 +893,15 @@ onTrigger(trigger: ActorTrigger) {
                     const receivers = [];
                     if (registry) {
                         registry.forEach((store, n) => {
-                            (store._actors || store.actors || []).forEach((a, i) => {
+                            const actorsList = store._actors || store.actors || [];
+                            actorsList.forEach((a, i) => {
                                 if (a !== actor) {
-                                    receivers.push((store._actors || store.actors).length > 1 ? n + '[' + i + ']' : n);
+                                    receivers.push(actorsList.length > 1 ? n + '[' + i + ']' : n);
                                 }
                             });
                         });
                     }
-                    logTrigger(name, state, actorName, receivers.slice(0, 100));
+                    logTrigger(name, state, actorName, receivers.slice(0, MAX_RECEIVERS));
                     return originalTrigger(trigger);
                 };
             }
@@ -908,9 +915,9 @@ onTrigger(trigger: ActorTrigger) {
             if (!registry) return 0;
             let hooked = 0;
             registry.forEach((store, name) => {
-                const actors = store._actors || store.actors || [];
-                actors.forEach((actor, idx) => {
-                    const actorName = actors.length > 1 ? name + '[' + idx + ']' : name;
+                const actorsList = store._actors || store.actors || [];
+                actorsList.forEach((actor, idx) => {
+                    const actorName = actorsList.length > 1 ? name + '[' + idx + ']' : name;
                     if (hookActor(actor, actorName)) hooked++;
                 });
             });
