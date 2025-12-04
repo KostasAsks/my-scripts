@@ -1,0 +1,730 @@
+// ==UserScript==
+// @name         Pixi Anim Watch Popup Window
+// @namespace    pixi.anim.watch
+// @version      2.3.1
+// @description  Popup για Pixi animations. Alt+5 toggle. Modern UI. Dynamic grid detection.
+// @match        https://pdev-ws.zeusplay.com/*
+// @match        https://pdev-partner-simulator.zeusplay.com/*
+// @match        http://localhost:*/*
+// @match        https://localhost:*/*
+// @match        http://127.0.0.1:*/*
+// @match        https://127.0.0.1:*/*
+// @match        http://192.168.1.39:*/*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+(() => {
+  const MAX_EVENTS_PER_ACTOR = 300;
+  const MAX_SHOW_EVENTS = 120;
+  const MAX_ACTORS = 2000;
+  const COOLDOWN_MS = 220;
+  const SKIP_SEG = /^(Container|Graphics|SpineSprite|SpineMesh|Spine\d*)$/i;
+  const SKIP_LABEL = /^e$/i;  // Skip only 'e' labels in display
+  const STRIP_LAYER_SEG = /^(front|middle|back)-actor-container$/i;
+
+  const DEFAULT_GRID_COLS = 5;
+  const DEFAULT_GRID_ROWS = 3;
+
+  let state = null;
+  let hooked = false;
+  let winRef = null;
+  let refreshTimer = null;
+  let highlightOverlay = null;
+  let pixiApp = null;
+  let collapsedGroups = new Set();
+  let leftPanelWidth = 520;
+
+  window.addEventListener("keydown", (e) => {
+    if (e.altKey && e.key === "5") { e.preventDefault(); e.stopPropagation(); togglePopup(); }
+  });
+
+  function togglePopup() {
+    if (winRef && !winRef.closed) { winRef.close(); winRef = null; stopRefresh(); clearHighlight(); return; }
+    if (winRef && winRef.closed) winRef = null;
+    if (!hooked) tryHookPixi();
+    openPopup();
+  }
+
+  function tryHookPixi() {
+    const canvas = document.querySelector("canvas");
+    const app = canvas?.__PIXI_APP__ || window.__PIXI_APP__ || window.PIXI_APP || window.pixiApp || window.app || (window.game && window.game.app) || window.gameApp;
+    if (!app?.stage) return false;
+    pixiApp = app;
+    state = { paused: false, actors: new Map(), pathMap: new WeakMap(), keyMap: new WeakMap(), selected: null, pinned: null, search: "", filter: "all" };
+    hookAddChild(Object.getPrototypeOf(app.stage));
+    patchDisplayObject(app.stage);
+    seedActors(app.stage);
+    hooked = true;
+    return true;
+  }
+
+  function openPopup() {
+    try {
+      const w = window.open("", "PixiAnimWatch", "width=1400,height=850,resizable=yes,scrollbars=yes");
+      if (!w) { alert('Popup blocked'); return; }
+      winRef = w;
+      winRef.document.title = "Pixi Anim Watch";
+      mountUI(winRef);
+      startRefresh();
+    } catch (err) { console.error("[pxw] Error:", err); }
+  }
+
+  function startRefresh() {
+    stopRefresh();
+    refreshTimer = setInterval(() => {
+      if (!winRef || winRef.closed) { stopRefresh(); clearHighlight(); return; }
+      if (!state) return;
+      renderActors(winRef.document, true);
+      if (state.selected) renderEvents(winRef.document, true);
+      updateHighlight();
+    }, 800);
+  }
+
+  function stopRefresh() { if (refreshTimer) clearInterval(refreshTimer); refreshTimer = null; }
+
+  function createHighlightOverlay() {
+    if (highlightOverlay) return highlightOverlay;
+    const div = document.createElement("div");
+    div.id = "__pxw_highlight__";
+    Object.assign(div.style, {
+      position: "fixed", border: "3px solid #00BFFF", background: "rgba(0, 191, 255, 0.15)",
+      boxShadow: "0 0 0 1px #000, 0 0 20px rgba(0,191,255,0.4)", pointerEvents: "none",
+      zIndex: "2147483645", display: "none", boxSizing: "border-box", borderRadius: "4px",
+    });
+    const label = document.createElement("div");
+    label.className = "__pxw_label__";
+    Object.assign(label.style, {
+      position: "absolute", bottom: "100%", left: "-3px",
+      background: "linear-gradient(135deg, #00BFFF 0%, #0088cc 100%)",
+      color: "#000", padding: "4px 10px", fontSize: "11px", fontFamily: "system-ui",
+      fontWeight: "bold", whiteSpace: "nowrap", borderRadius: "4px 4px 0 0",
+    });
+    div.appendChild(label);
+    document.body.appendChild(div);
+    highlightOverlay = div;
+    return div;
+  }
+
+  function clearHighlight() { if (highlightOverlay) highlightOverlay.style.display = "none"; }
+
+  function updateHighlight() {
+    if (!state?.selected) { clearHighlight(); return; }
+    const actor = state.actors.get(state.selected);
+    if (!actor?.ref) { clearHighlight(); return; }
+    const obj = actor.ref;
+    if (!obj.parent && obj !== pixiApp?.stage) { clearHighlight(); return; }
+    try {
+      const bounds = obj.getBounds();
+      if (!bounds || bounds.width === 0 || bounds.height === 0) { clearHighlight(); return; }
+      const canvas = pixiApp?.view || pixiApp?.renderer?.view;
+      if (!canvas) { clearHighlight(); return; }
+      const rect = canvas.getBoundingClientRect();
+      const sx = rect.width / (pixiApp.renderer?.width || canvas.width);
+      const sy = rect.height / (pixiApp.renderer?.height || canvas.height);
+      const overlay = createHighlightOverlay();
+      Object.assign(overlay.style, {
+        left: `${rect.left + bounds.x * sx}px`, top: `${rect.top + bounds.y * sy}px`,
+        width: `${bounds.width * sx}px`, height: `${bounds.height * sy}px`, display: "block",
+      });
+      overlay.querySelector(".__pxw_label__").textContent = actor.name || actor.key;
+    } catch (e) { clearHighlight(); }
+  }
+
+  function mountUI(w) {
+    const doc = w.document;
+    doc.head.innerHTML = `<style>
+      * { box-sizing: border-box; }
+      body { margin:0; background: linear-gradient(180deg, #080c12 0%, #0a1018 100%); color:#e0f0ff; font:13px/1.5 system-ui, sans-serif; }
+      .hdr { padding: 10px 16px; background: linear-gradient(180deg, #101820 0%, #0c1418 100%); border-bottom: 1px solid #1a2a3a; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+      .hdr-title { font-size: 15px; font-weight: 700; color: #7ef; }
+      .hdr-title::before { content: "🎬 "; }
+      .btn { background: linear-gradient(135deg, #1a2a3a 0%, #0d1a26 100%); color: #adf; border: 1px solid #2a4a6a; border-radius: 6px; padding: 5px 12px; cursor: pointer; font: inherit; font-size: 12px; }
+      .btn:hover { background: linear-gradient(135deg, #2a3a4a 0%, #1a2a36 100%); }
+      .btn-danger { background: linear-gradient(135deg, #3a1a1a 0%, #2a0d0d 100%); border-color: #5a2a2a; color: #faa; }
+      .btn.active { background: linear-gradient(135deg, #2a4a3a 0%, #1a3a2a 100%); color: #7fa; }
+      .filter-group { display: flex; gap: 2px; background: #0a1218; padding: 3px; border-radius: 6px; border: 1px solid #1a2a3a; }
+      .filter-btn { background: transparent; border: none; color: #7a9aba; padding: 4px 10px; border-radius: 4px; cursor: pointer; font: inherit; font-size: 11px; }
+      .filter-btn:hover { background: #1a2a3a; color: #adf; }
+      .filter-btn.active { background: #1a3a4a; color: #7ef; }
+      input.search { background: #0a1218; border: 1px solid #1a2a3a; color: #e0f0ff; padding: 6px 12px; border-radius: 6px; width: 180px; font: inherit; font-size: 12px; }
+      input.search:focus { outline: none; border-color: #3a6a9a; }
+      .stat-badge { background: #1a2a3a; color: #7ab; padding: 4px 10px; border-radius: 12px; font-size: 11px; }
+      .main { height: calc(100vh - 52px); display: flex; }
+      .left { background: #0c1418; border-right: 1px solid #1a2a3a; overflow-y: auto; flex-shrink: 0; }
+      .resize-handle { width: 6px; background: #1a2228; cursor: col-resize; }
+      .resize-handle:hover { background: #2a4a6a; }
+      .right { background: #080c10; overflow: auto; padding: 12px; flex: 1; min-width: 300px; }
+      .left::-webkit-scrollbar, .right::-webkit-scrollbar { width: 8px; }
+      .left::-webkit-scrollbar-thumb, .right::-webkit-scrollbar-thumb { background: #2a3a4a; border-radius: 4px; }
+      .group { border-bottom: 1px solid #1a2228; }
+      .group-header { display: flex; justify-content: space-between; padding: 8px 10px; background: #101820; cursor: pointer; user-select: none; }
+      .group-header:hover { background: #141c24; }
+      .group-header-left { display: flex; align-items: center; gap: 6px; }
+      .group-toggle { color: #4a6a8a; font-size: 10px; transition: transform 0.2s; }
+      .group.collapsed .group-toggle { transform: rotate(-90deg); }
+      .group-name { font-weight: 600; color: #adf; font-size: 12px; }
+      .group-stats { display: flex; gap: 8px; font-size: 10px; color: #5a7a9a; }
+      .group-body { padding: 6px; }
+      .group.collapsed .group-body { display: none; }
+
+      .col-grid { display: grid; gap: 3px; padding: 4px; background: #080c10; border-radius: 6px; }
+      .col-grid-col { display: flex; flex-direction: column; gap: 3px; }
+      .col-grid-header { font-size: 9px; color: #5a7a9a; text-align: center; padding: 2px; background: #0a1218; border-radius: 3px; }
+
+      .row-grid { display: flex; flex-direction: column; gap: 3px; padding: 4px; background: #080c10; border-radius: 6px; }
+      .row-grid-row { display: grid; gap: 3px; }
+      .row-grid-header { display: grid; gap: 3px; margin-bottom: 2px; }
+      .row-grid-label { font-size: 9px; color: #5a7a9a; text-align: center; padding: 2px; background: #0a1218; border-radius: 3px; }
+
+      .slot-cell { height: 36px; background: #0c1418; border: 1px solid #1a2228; border-radius: 4px; display: flex; align-items: center; justify-content: center; position: relative; font-size: 10px; color: #3a4a5a; }
+      .slot-cell.empty { opacity: 0.3; }
+      .slot-cell.has-actor { cursor: pointer; background: #101820; border-color: #2a4a5a; color: #adf; font-weight: 500; }
+      .slot-cell.has-actor:hover { border-color: #3a6a9a; background: #142028; }
+      .slot-cell.selected { border-color: #4a9aba !important; background: #1a3a4a !important; box-shadow: 0 0 0 2px rgba(60,150,200,0.3); }
+      .slot-cell.playing { border-color: #4a8a5a; background: #1a3a2a; animation: cell-pulse 1.5s infinite; }
+      .slot-cell.has-actor.hidden { opacity: 0.35; border-color: #1a2228; background: #0c1418; }
+      .slot-cell.has-actor.hidden:hover { opacity: 0.5; border-color: #2a3a4a; }
+      @keyframes cell-pulse { 0%, 100% { box-shadow: 0 0 4px rgba(100,200,150,0.3); } 50% { box-shadow: 0 0 10px rgba(100,200,150,0.6); } }
+      .slot-cell-badge { position: absolute; top: 2px; right: 2px; width: 6px; height: 6px; border-radius: 50%; background: #7fa; }
+      .slot-cell-pos { font-size: 7px; color: #3a5a7a; position: absolute; bottom: 1px; left: 2px; }
+
+      .actor-list { display: flex; flex-direction: column; gap: 3px; }
+      .actor-item { padding: 6px 8px; border-radius: 5px; background: #0a1218; border: 1px solid #151d25; cursor: pointer; }
+      .actor-item:hover { background: #101820; border-color: #2a3a4a; }
+      .actor-item.selected { background: #1a2a3a; border-color: #3a6a9a; }
+      .actor-item.hidden { opacity: 0.35; }
+      .actor-item-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+      .actor-name { font-weight: 500; color: #d0e8ff; font-size: 12px; overflow: hidden; text-overflow: ellipsis; }
+      .status-badge { padding: 2px 6px; border-radius: 8px; font-size: 9px; font-weight: 600; }
+      .status-badge.playing { background: #1a3a2a; color: #7fa; border: 1px solid #2a5a3a; }
+      .status-badge.played { background: #1a1a2a; color: #a8a; border: 1px solid #2a2a4a; }
+      .actor-meta { font-size: 10px; color: #5a7a9a; display: flex; gap: 10px; margin-top: 3px; }
+
+      .section { background: #0c1418; border: 1px solid #1a2a3a; border-radius: 8px; overflow: hidden; margin-bottom: 10px; }
+      .section-header { display: flex; justify-content: space-between; padding: 8px 12px; background: #101820; border-bottom: 1px solid #1a2a3a; }
+      .section-title { font-weight: 600; font-size: 12px; }
+      .section-title.playing { color: #7fa; }
+      .section-title.playing::before { content: "▶ "; }
+      .section-title.played { color: #a8a; }
+      .section-title.played::before { content: "⏸ "; }
+      .section-count { background: #1a2a3a; color: #7ab; padding: 2px 8px; border-radius: 10px; font-size: 11px; }
+      .event-list { padding: 6px; display: flex; flex-direction: column; gap: 6px; }
+      .event-card { padding: 10px 12px; background: #0a1218; border: 1px solid #151d25; border-radius: 6px; }
+      .event-anim { color: #7ef; font-weight: 600; font-size: 14px; margin-bottom: 6px; }
+      .event-detail { color: #d0e8ff; font-size: 13px; padding: 8px 10px; background: #080c10; border-radius: 4px; margin: 6px 0; font-family: monospace; border-left: 3px solid #3a6a9a; }
+      .event-path { color: #5a7a9a; font-size: 11px; word-break: break-all; }
+      .empty { padding: 20px; text-align: center; color: #4a6a8a; font-style: italic; }
+      .selected-info { background: #1a2a3a; border: 1px solid #2a4a6a; border-radius: 8px; padding: 12px 16px; margin-bottom: 12px; }
+      .selected-info-title { font-size: 16px; font-weight: 600; color: #7ef; margin-bottom: 4px; }
+      .selected-info-path { font-size: 11px; color: #5a7a9a; word-break: break-all; }
+    </style>`;
+
+    if (!state) {
+      doc.body.innerHTML = `<div class="hdr"><div class="hdr-title">Pixi Anim Watch</div><div style="flex:1;"></div><button id="pxw-retry" class="btn">🔄 Retry</button><button id="pxw-close" class="btn btn-danger">✕</button></div><div class="empty" style="padding:40px;font-size:16px;">⚠️ No Pixi app found!</div>`;
+      doc.getElementById("pxw-close").onclick = () => { winRef?.close(); winRef = null; stopRefresh(); };
+      doc.getElementById("pxw-retry").onclick = () => { if (tryHookPixi()) mountUI(w); };
+      return;
+    }
+
+    doc.body.innerHTML = `
+      <div class="hdr">
+        <div class="hdr-title">Pixi Anim Watch</div>
+        <span id="pxw-count" class="stat-badge">0</span>
+        <input id="pxw-search" class="search" placeholder="🔍 Search...">
+        <div class="filter-group">
+          <button class="filter-btn active" data-filter="all">All</button>
+          <button class="filter-btn" data-filter="playing">▶ Playing</button>
+          <button class="filter-btn" data-filter="visible">👁 Visible</button>
+        </div>
+        <div style="flex:1;"></div>
+        <button id="pxw-pause" class="btn">⏸ Pause</button>
+        <button id="pxw-close" class="btn btn-danger">✕</button>
+      </div>
+      <div class="main">
+        <div class="left" id="pxw-actors" style="width:${leftPanelWidth}px;"></div>
+        <div class="resize-handle" id="pxw-resize"></div>
+        <div class="right" id="pxw-events"></div>
+      </div>`;
+
+    const leftPanel = doc.getElementById("pxw-actors");
+    const resizeHandle = doc.getElementById("pxw-resize");
+    let isResizing = false;
+    resizeHandle.onmousedown = (e) => { isResizing = true; e.preventDefault(); };
+    w.onmousemove = (e) => { if (isResizing) leftPanel.style.width = Math.min(Math.max(e.clientX, 300), 900) + "px"; };
+    w.onmouseup = () => { isResizing = false; };
+
+    doc.getElementById("pxw-close").onclick = () => { winRef?.close(); winRef = null; stopRefresh(); clearHighlight(); };
+    doc.getElementById("pxw-pause").onclick = function() { state.paused = !state.paused; this.textContent = state.paused ? "▶ Resume" : "⏸ Pause"; this.classList.toggle("active", state.paused); };
+    doc.getElementById("pxw-search").oninput = function() { state.search = this.value.toLowerCase(); renderActors(doc, true); };
+
+    doc.querySelectorAll(".filter-btn").forEach(btn => {
+      btn.onclick = function() {
+        doc.querySelectorAll(".filter-btn").forEach(b => b.classList.remove("active"));
+        this.classList.add("active");
+        state.filter = this.dataset.filter;
+        renderActors(doc, true);
+      };
+    });
+
+    const actorsRoot = doc.getElementById("pxw-actors");
+    actorsRoot.onclick = (e) => {
+      const groupHeader = e.target.closest(".group-header");
+      if (groupHeader) {
+        const groupName = groupHeader.closest(".group")?.dataset.group;
+        if (groupName) { collapsedGroups.has(groupName) ? collapsedGroups.delete(groupName) : collapsedGroups.add(groupName); renderActors(doc, true); }
+        return;
+      }
+      const key = e.target.closest(".slot-cell.has-actor")?.dataset.key || e.target.closest(".actor-item")?.dataset.key;
+      if (!key) return;
+      state.selected = state.selected === key && state.pinned !== key ? null : key;
+      updateHighlight(); renderActors(doc, true); renderEvents(doc, true);
+    };
+    actorsRoot.ondblclick = (e) => {
+      const key = e.target.closest(".slot-cell.has-actor")?.dataset.key || e.target.closest(".actor-item")?.dataset.key;
+      if (!key) return;
+      state.pinned = state.pinned === key ? null : key;
+      state.selected = key;
+      updateHighlight(); renderActors(doc, true); renderEvents(doc, true);
+    };
+
+    renderActors(doc);
+    renderEvents(doc);
+  }
+
+  function rawLabel(o) {
+    return o?.name || o?.label || o?.actorName || o?.id || o?.constructor?.name || "actor";
+  }
+
+  function shouldSkipLabel(nm) {
+    return SKIP_LABEL.test(nm);
+  }
+
+  function normalizeSegments(nm) {
+    if (!nm) return [];
+    if (STRIP_LAYER_SEG.test(nm)) return [];
+    // Skip 'e' labels only
+    if (shouldSkipLabel(nm)) return [];
+    let m;
+    if ((m = /^reel[-:]?(\d+)[-:]?(\d+)/i.exec(nm))) return [`Reel:${m[1]}`, `Cell:${m[2]}`];
+    if ((m = /^reel[-:]?(\d+)/i.exec(nm))) return [`Reel:${m[1]}`];
+    if ((m = /container-reel-(\d+)/i.exec(nm))) return [`Reel:${m[1]}`];
+    if ((m = /reel-(\d+)-cell-(\d+)/i.exec(nm))) return [`Reel:${m[1]}`, `Cell:${m[2]}`];
+    if (/^cell/i.test(nm)) { const nums = nm.match(/\d+/g); return nums?.length ? [`Cell:${nums[nums.length-1]}`] : ["Cell:?"]; }
+    if ((m = /^sym(?:bol)?[-:;_]?(\d+)/i.exec(nm))) return [`sym:${m[1].padStart(2,"0")}`];
+    if ((m = /^scatter[-:;_]?(\d+)/i.exec(nm))) return [`scatter:${m[1]}`];
+    if (/wild/i.test(nm)) { const wm = /wild[-:;_]?(\d+)/i.exec(nm); return wm ? [`wild:${wm[1]}`] : ["wild"]; }
+    return [nm];
+  }
+
+  function buildPath(node) {
+    const segs = [];
+    let cur = node;
+    while (cur) {
+      const nm = rawLabel(cur);
+      if (!SKIP_SEG.test(nm) && !shouldSkipLabel(nm)) {
+        segs.push(...normalizeSegments(nm));
+      }
+      cur = cur.parent;
+    }
+    return segs.length ? segs.reverse().join("/") : "stage";
+  }
+
+  function extractReelNum(path) {
+    const reelMatch = path.match(/Reel:(\d+)/i);
+    if (reelMatch) return parseInt(reelMatch[1]);
+    return -1;
+  }
+
+  function extractCellNum(path) {
+    const cellMatch = path.match(/Cell:(\d+)/i);
+    if (cellMatch) return parseInt(cellMatch[1]);
+    return -1;
+  }
+
+  function parsePathInfo(path) {
+    const parts = path.split("/");
+    let mg = null, sym = null;
+    for (const p of parts) {
+      const l = p.toLowerCase();
+      if (!mg && l.startsWith("mg:")) mg = p;
+      if (!sym && (/^sym:\d+/i.test(p) || /^scatter:\d+/i.test(p) || /^wild/i.test(p))) sym = p;
+    }
+    const reelNum = extractReelNum(path);
+    const cellNum = extractCellNum(path);
+    return { parts, mg, sym, reelNum, cellNum, lastNonSpine: parts[parts.length-1] };
+  }
+
+  function displayName(path) { const i = parsePathInfo(path); return i.sym || i.parts[0] || path; }
+
+  function groupLabel(path, name) {
+    const i = parsePathInfo(path);
+    if (i.mg) return i.mg;
+    if (/sticky/i.test(path)) return "stickies";
+    if (/^scatter:\d+/i.test(name)) return "scatter:" + (name.match(/\d+/)?.[0] || "");
+    if (/^sym:\d+/i.test(name)) return "symbols";
+    return name;
+  }
+
+  function itemLabel(path) { const i = parsePathInfo(path); return i.sym || i.lastNonSpine || path; }
+
+  function shouldUseGrid(groupName) {
+    if (/^mg:/i.test(groupName)) return true;
+    if (/sticky|stickies/i.test(groupName)) return true;
+    if (/^scatter:\d+/i.test(groupName)) return true;
+    if (/^wild/i.test(groupName)) return true;
+    if (/^sym:\d+/i.test(groupName)) return true;
+    return false;
+  }
+
+  function analyzeGridProperties(actors) {
+    let minReel = Infinity, maxReel = -1;
+    let minCell = Infinity, maxCell = -1;
+    let hasReelAndCell = false;
+    let hasTrailingIndex = false;
+
+    for (const a of actors) {
+      const reelNum = extractReelNum(a.path);
+      const cellNum = extractCellNum(a.path);
+
+      if (reelNum >= 0 && cellNum >= 0) {
+        hasReelAndCell = true;
+        minReel = Math.min(minReel, reelNum);
+        maxReel = Math.max(maxReel, reelNum);
+        minCell = Math.min(minCell, cellNum);
+        maxCell = Math.max(maxCell, cellNum);
+      } else if (reelNum >= 0) {
+        minReel = Math.min(minReel, reelNum);
+        maxReel = Math.max(maxReel, reelNum);
+      }
+
+      if (a.rawName) {
+        const trailingMatch = a.rawName.match(/-(\d+)$/);
+        if (trailingMatch) {
+          const idx = parseInt(trailingMatch[1]);
+          if (idx >= 0 && idx < DEFAULT_GRID_COLS * DEFAULT_GRID_ROWS) {
+            hasTrailingIndex = true;
+          }
+        }
+      }
+    }
+
+    return {
+      hasReelAndCell,
+      hasTrailingIndex,
+      minReel: minReel === Infinity ? 0 : minReel,
+      maxReel: maxReel === -1 ? 0 : maxReel,
+      minCell: minCell === Infinity ? 0 : minCell,
+      maxCell: maxCell === -1 ? 0 : maxCell,
+      reelOffset: minReel === Infinity ? 0 : minReel,
+      cellOffset: minCell === Infinity ? 0 : minCell,
+    };
+  }
+
+  function detectGridType(actors) {
+    const props = analyzeGridProperties(actors);
+    if (props.hasReelAndCell) return 'col';
+    if (props.hasTrailingIndex || props.maxReel >= 0) return 'row';
+    return null;
+  }
+
+  function getGridIndex(actor) {
+    if (actor.rawName) {
+      const trailingMatch = actor.rawName.match(/-(\d+)$/);
+      if (trailingMatch) {
+        const idx = parseInt(trailingMatch[1]);
+        if (idx >= 0 && idx < DEFAULT_GRID_COLS * DEFAULT_GRID_ROWS) {
+          return idx;
+        }
+      }
+    }
+    const reelNum = extractReelNum(actor.path);
+    if (reelNum >= 0 && reelNum < DEFAULT_GRID_COLS * DEFAULT_GRID_ROWS) {
+      return reelNum;
+    }
+    return -1;
+  }
+
+  function ensureActor(obj) {
+    if (!state) return null;
+    const path = buildPath(obj), key = path, name = displayName(path), group = groupLabel(path, name);
+    const rawName = rawLabel(obj);
+
+    if (!state.actors.has(key)) {
+      state.actors.set(key, { key, name, group, path, rawName, events: [], hits: 0, ref: obj, order: state.actors.size, playingTracks: new Map() });
+      if (state.actors.size > MAX_ACTORS) { const fk = state.actors.keys().next().value; if (fk !== state.pinned) state.actors.delete(fk); }
+    }
+    const actor = state.actors.get(key);
+    actor.ref = obj; actor.path = path; actor.name = name; actor.group = group; actor.rawName = rawName;
+    state.pathMap.set(obj, path); state.keyMap.set(obj, key);
+    if (!actor.playingTracks) actor.playingTracks = new Map();
+    return actor;
+  }
+
+  function isVisibleActor(actor) {
+    const o = actor.ref;
+    if (!o) return false;
+    let cur = o;
+    while (cur) { if (cur.visible === false || cur.renderable === false) return false; cur = cur.parent; }
+    return true;
+  }
+
+  function isPlayingNow(actor) { return actor.playingTracks && actor.playingTracks.size > 0; }
+
+  function actorItemHtml(a) {
+    const playingNow = isPlayingNow(a);
+    const visible = isVisibleActor(a);
+    return `<div data-key="${a.key}" class="actor-item${visible ? '' : ' hidden'}${a.key === state.selected ? ' selected' : ''}">
+      <div class="actor-item-top"><span class="actor-name">${itemLabel(a.path)}</span><span class="status-badge ${playingNow ? 'playing' : 'played'}">${playingNow ? '▶' : '■'}</span></div>
+      <div class="actor-meta"><span>⚡${a.hits}</span><span>🎬${a.events.length}</span></div></div>`;
+  }
+
+  function buildCellHtml(actor, posLabel) {
+    const playingNow = isPlayingNow(actor);
+    const selected = actor.key === state.selected;
+    const visible = isVisibleActor(actor);
+    const label = itemLabel(actor.path);
+    const shortLabel = label.length > 10 ? label.substring(0, 8) + ".." : label;
+
+    return `<div data-key="${actor.key}" class="slot-cell has-actor${playingNow ? ' playing' : ''}${selected ? ' selected' : ''}${visible ? '' : ' hidden'}">
+      ${playingNow ? '<div class="slot-cell-badge"></div>' : ''}
+      ${shortLabel}
+      <span class="slot-cell-pos">${posLabel}</span>
+    </div>`;
+  }
+
+  function buildColGridHtml(actors) {
+    const props = analyzeGridProperties(actors);
+    const grid = {};
+
+    actors.forEach(a => {
+      const reelNum = extractReelNum(a.path);
+      const cellNum = extractCellNum(a.path);
+      if (reelNum >= 0 && cellNum >= 0) {
+        const key = `${reelNum}_${cellNum}`;
+        const existing = grid[key];
+        if (!existing || isPlayingNow(a) || (!isPlayingNow(existing) && a.hits > existing.hits)) {
+          grid[key] = a;
+        }
+      }
+    });
+
+    const numCols = props.maxReel - props.minReel + 1;
+
+    let html = `<div class="col-grid" style="grid-template-columns: repeat(${numCols}, 1fr);">`;
+    for (let reel = props.minReel; reel <= props.maxReel; reel++) {
+      const displayReel = reel;
+      html += `<div class="col-grid-col"><div class="col-grid-header">R${displayReel}</div>`;
+      for (let cell = props.minCell; cell <= props.maxCell; cell++) {
+        const actor = grid[`${reel}_${cell}`];
+        const posLabel = `${reel}:${cell}`;
+        if (actor) {
+          html += buildCellHtml(actor, posLabel);
+        } else {
+          html += `<div class="slot-cell empty"><span class="slot-cell-pos">${posLabel}</span></div>`;
+        }
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+    return html;
+  }
+
+  function buildRowGridHtml(actors, cols, rows) {
+    cols = cols || DEFAULT_GRID_COLS;
+    rows = rows || DEFAULT_GRID_ROWS;
+    const grid = Array(rows).fill(null).map(() => Array(cols).fill(null));
+
+    actors.forEach(a => {
+      const index = getGridIndex(a);
+      if (index >= 0 && index < rows * cols) {
+        const row = Math.floor(index / cols);
+        const col = index % cols;
+        const existing = grid[row][col];
+        if (!existing || isPlayingNow(a) || (!isPlayingNow(existing) && a.hits > existing.hits)) {
+          grid[row][col] = a;
+        }
+      }
+    });
+
+    let html = `<div class="row-grid">`;
+    html += `<div class="row-grid-header" style="grid-template-columns: repeat(${cols}, 1fr);">`;
+    for (let col = 0; col < cols; col++) {
+      html += `<div class="row-grid-label">${col}</div>`;
+    }
+    html += '</div>';
+
+    for (let row = 0; row < rows; row++) {
+      html += `<div class="row-grid-row" style="grid-template-columns: repeat(${cols}, 1fr);">`;
+      for (let col = 0; col < cols; col++) {
+        const index = row * cols + col;
+        const actor = grid[row][col];
+        if (actor) {
+          html += buildCellHtml(actor, index.toString());
+        } else {
+          html += `<div class="slot-cell empty"><span class="slot-cell-pos">${index}</span></div>`;
+        }
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+    return html;
+  }
+
+  function renderActors(doc, preserveScroll = false) {
+    if (!state) return;
+    const el = doc.getElementById("pxw-actors"); if (!el) return;
+    const countEl = doc.getElementById("pxw-count");
+    const prev = preserveScroll ? el.scrollTop : 0;
+    const s = state.search;
+
+    let filtered = Array.from(state.actors.values()).filter(a => {
+      if (!a.events.length) return false;
+      if (s && !a.name.toLowerCase().includes(s) && !a.path.toLowerCase().includes(s)) return false;
+      if (state.filter === "playing" && !isPlayingNow(a)) return false;
+      if (state.filter === "visible" && !isVisibleActor(a)) return false;
+      return true;
+    });
+
+    if (countEl) countEl.textContent = `${filtered.length}`;
+
+    const groups = new Map();
+    filtered.forEach(a => {
+      const g = a.group || a.name;
+      if (!groups.has(g)) groups.set(g, []);
+      groups.get(g).push(a);
+    });
+
+    const groupsHtml = Array.from(groups.entries()).sort((a,b) => a[0].localeCompare(b[0])).map(([name, arr]) => {
+      const totalHits = arr.reduce((x,y) => x + y.hits, 0);
+      const playingCount = arr.filter(a => isPlayingNow(a)).length;
+      const isCollapsed = collapsedGroups.has(name);
+
+      const useGrid = shouldUseGrid(name);
+      const gridType = useGrid ? detectGridType(arr) : null;
+
+      let bodyHtml;
+      let gridLabel = '';
+
+      if (gridType === 'col') {
+        bodyHtml = buildColGridHtml(arr);
+        const props = analyzeGridProperties(arr);
+        const numCols = props.maxReel - props.minReel + 1;
+        const numRows = props.maxCell - props.minCell + 1;
+        gridLabel = `[${numCols}×${numRows}]`;
+      } else if (gridType === 'row') {
+        const maxIndex = Math.max(...arr.map(a => getGridIndex(a)).filter(i => i >= 0), 0);
+        const neededCells = maxIndex + 1;
+        const cols = Math.min(DEFAULT_GRID_COLS, Math.max(neededCells, 1));
+        const rows = Math.ceil(neededCells / cols);
+        bodyHtml = buildRowGridHtml(arr, cols, rows);
+        gridLabel = `[${cols}×${rows}]`;
+      } else {
+        const sorted = arr.slice().sort((a,b) => {
+          const pa = isPlayingNow(a)?1:0, pb = isPlayingNow(b)?1:0;
+          if (pa!==pb) return pb-pa;
+          return a.name.localeCompare(b.name);
+        });
+        bodyHtml = `<div class="actor-list">${sorted.map(x => actorItemHtml(x)).join("")}</div>`;
+      }
+
+      return `<div class="group ${isCollapsed ? 'collapsed' : ''}" data-group="${name}">
+        <div class="group-header">
+          <div class="group-header-left">
+            <span class="group-toggle">▼</span>
+            <span class="group-name">${name}</span>
+            ${gridLabel ? `<span style="font-size:9px;color:#5a7a9a;margin-left:4px;">${gridLabel}</span>` : ''}
+          </div>
+          <div class="group-stats">
+            ${playingCount > 0 ? `<span style="color:#7fa;">▶${playingCount}</span>` : ''}
+            <span>${arr.length}</span>
+            <span>⚡${totalHits}</span>
+          </div>
+        </div>
+        <div class="group-body">${bodyHtml}</div>
+      </div>`;
+    }).join("");
+
+    el.innerHTML = groupsHtml || '<div class="empty">No animations found</div>';
+    if (preserveScroll) el.scrollTop = prev;
+  }
+
+  function renderEvents(doc, preserveScroll = false) {
+    if (!state) return;
+    const el = doc.getElementById("pxw-events"); if (!el) return;
+    const prev = preserveScroll ? el.scrollTop : 0;
+    const act = state.selected && state.actors.get(state.selected);
+    if (!act) {
+      el.innerHTML = `<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:#4a6a8a;"><div style="font-size:48px;margin-bottom:16px;">🎬</div><div>Select an actor</div></div>`;
+      return;
+    }
+
+    const playing = [], played = [], used = new Set();
+    (act.playingTracks ? Array.from(act.playingTracks.values()).map(p=>p.detail) : []).forEach(det => {
+      const ev = act.events.find(e=>e.detail===det);
+      if (ev) { playing.push(ev); used.add(ev); }
+    });
+    act.events.slice(0, MAX_SHOW_EVENTS).forEach(ev => { if (!used.has(ev)) played.push(ev); });
+
+    const renderList = list => list.length === 0 ? '<div class="empty">No animations</div>' : `<div class="event-list">${list.map(ev => `<div class="event-card"><div class="event-anim">🎬 ${ev.actor}</div><div class="event-detail">${ev.detail}</div><div class="event-path">📍 ${ev.path}</div></div>`).join("")}</div>`;
+
+    el.innerHTML = `
+      <div class="selected-info"><div class="selected-info-title">📌 ${act.name}</div><div class="selected-info-path">${act.path}</div></div>
+      <div class="section"><div class="section-header"><div class="section-title playing">Playing</div><span class="section-count">${playing.length}</span></div>${renderList(playing)}</div>
+      <div class="section"><div class="section-header"><div class="section-title played">History</div><span class="section-count">${played.length}</span></div>${renderList(played)}</div>`;
+    if (preserveScroll) el.scrollTop = prev;
+  }
+
+  const lastAnim = new Map();
+  function pushAnimEvent(target, detail, isLoop, trackIndex) {
+    if (!state || state.paused || !target) return;
+    const actor = ensureActor(target); if (!actor) return;
+    const key = `${actor.key}|anim`, now = Date.now();
+    if (lastAnim.get(key) && now - lastAnim.get(key) < COOLDOWN_MS && lastAnim.get(`${key}:detail`) === detail) return;
+    lastAnim.set(key, now); lastAnim.set(`${key}:detail`, detail);
+    if (!actor.playingTracks) actor.playingTracks = new Map();
+    if (trackIndex !== undefined && trackIndex !== null) actor.playingTracks.set(trackIndex, { detail, loop: !!isLoop, ts: now });
+    for (let i = actor.events.length - 1; i >= 0; i--) if (actor.events[i].detail === detail) actor.events.splice(i, 1);
+    actor.events.unshift({ detail, actor: actor.name, path: actor.path, ts: now, loop: !!isLoop });
+    if (actor.events.length > MAX_EVENTS_PER_ACTOR) actor.events.length = MAX_EVENTS_PER_ACTOR;
+    actor.hits++;
+    if (winRef && !winRef.closed) { renderActors(winRef.document, true); if (state.selected === actor.key) renderEvents(winRef.document, true); }
+  }
+
+  function clearTrack(owner, trackIndex) { if (!state) return; const actor = state.actors?.get(owner && state.keyMap.get(owner)); if (actor?.playingTracks) actor.playingTracks.delete(trackIndex); }
+
+  function hookStateInstance(stateObj, owner) {
+    if (!stateObj || stateObj.__pwPatched) return;
+    ["setAnimation", "addAnimation", "setEmptyAnimation"].forEach(method => {
+      const orig = stateObj[method]; if (typeof orig !== "function") return;
+      stateObj[method] = function(trackIndex, animNameArg, loop, delay) {
+        const res = orig.call(this, trackIndex, animNameArg, loop, delay);
+        const animName = typeof animNameArg === "string" && animNameArg ? animNameArg : (this?.getCurrent?.(trackIndex)?.animation?.name || this?.tracks?.[trackIndex]?.animation?.name || "?");
+        if (method === "setEmptyAnimation") clearTrack(owner, trackIndex); else pushAnimEvent(owner, animName, !!loop, trackIndex);
+        return res;
+      };
+    });
+    stateObj.__pwPatched = true;
+  }
+
+  function patchDisplayObject(obj) {
+    if (!state || !obj || state.keyMap.has(obj)) return;
+    state.pathMap.set(obj, buildPath(obj)); state.keyMap.set(obj, buildPath(obj));
+    ensureActor(obj);
+    if (obj.state && typeof obj.state === "object") { obj.state.__pwOwner = obj; hookStateInstance(obj.state, obj); }
+    if (obj.children?.length) obj.children.forEach(c => patchDisplayObject(c));
+  }
+
+  function hookAddChild(proto) {
+    ["addChild", "addChildAt"].forEach(m => {
+      const orig = proto[m]; if (typeof orig !== "function" || orig.__pwPatched) return;
+      proto[m] = function(...kids) { const res = orig.apply(this, kids); kids.forEach(k => patchDisplayObject(k)); return res; };
+      proto[m].__pwPatched = true;
+    });
+  }
+
+  function seedActors(root) {
+    const walk = node => { if (!node) return; ensureActor(node); if (node.state && typeof node.state === "object") hookStateInstance(node.state, node); if (node.children) node.children.forEach(walk); };
+    walk(root);
+  }
+})();
