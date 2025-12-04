@@ -1,0 +1,419 @@
+// ==UserScript==
+// @name         PIXI Center to Window
+// @namespace    http://tampermonkey.net/
+// @version      2.3.0
+// @description  Centers selected PIXI object to window center
+// @match        https://pdev-ws.zeusplay.com/*
+// @match        https://pdev-partner-simulator.zeusplay.com/*
+// @match        http://localhost:*/*
+// @match        https://localhost:*/*
+// @match        http://127.0.0.1:*/*
+// @match        https://127.0.0.1:*/*
+// @match        http://192.168.1.39:*/*
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    let popup = null;
+    let selectedObject = null;
+    let isSelecting = false;
+    let isLocked = false;
+    let highlightOverlay = null;
+    let openPaths = new Set(['stage']);
+
+    let lastClickPos = { x: 0, y: 0 };
+    let lastClickTime = 0;
+    let clickCycleIndex = 0;
+    let lastFoundObjects = [];
+
+    const movedObjects = new Map();
+    const frozenObjects = new Map();
+
+    // Timer freeze state
+    let timersFrozen = false;
+    let originalSetTimeout = null;
+    let originalSetInterval = null;
+    let pendingTimeouts = [];
+    let pendingIntervals = [];
+    let pixiTickerSpeed = null;
+
+    const SKIP_LABELS = /^e$/i;
+    const GENERIC_PATTERNS = [/^Spine\d*$/i, /^Container\d*$/i, /^Sprite\d*$/i, /^SpineSprite\d*$/i, /^SpineMesh\d*$/i, /^Graphics\d*$/i, /^Mesh\d*$/i];
+
+    function isGenericName(name) { return !name || GENERIC_PATTERNS.some(p => p.test(name)); }
+    function shouldSkipInTree(label) { return SKIP_LABELS.test(label); }
+
+    function getPixiApp() {
+        const canvas = document.querySelector('canvas');
+        if (canvas?.__PIXI_APP__) return canvas.__PIXI_APP__;
+        if (window.__PIXI_APP__) return window.__PIXI_APP__;
+        if (window.pixiApp?.stage) return window.pixiApp;
+        if (window.app?.stage) return window.app;
+        if (window.game?.app?.stage) return window.game.app;
+        if (window.gameApp?.stage) return window.gameApp;
+        return null;
+    }
+
+    function getLabel(obj) { return obj?.name || obj?.label || `${obj?.constructor?.name || 'Obj'}${obj?.uid ? `#${obj.uid}` : ''}`; }
+
+    function collectAll(node, path = 'stage', list = []) {
+        const app = getPixiApp();
+        if (node !== app.stage) {
+            const label = getLabel(node);
+            if (!shouldSkipInTree(label)) list.push({ obj: node, path, label });
+        }
+        (node.children || []).forEach(c => {
+            const childLabel = getLabel(c);
+            collectAll(c, shouldSkipInTree(childLabel) ? path : `${path}/${childLabel}`, list);
+        });
+        return list;
+    }
+
+    function buildTree(nodes) {
+        const root = { label: 'stage', path: 'stage', children: new Map(), obj: null };
+        nodes.forEach(n => {
+            const segs = n.path.split('/').slice(1);
+            let cur = root, acc = 'stage';
+            segs.forEach((s, i) => {
+                acc += `/${s}`;
+                if (!cur.children.has(s)) cur.children.set(s, { label: s, path: acc, children: new Map(), obj: null });
+                cur = cur.children.get(s);
+                if (i === segs.length - 1) cur.obj = n.obj;
+            });
+        });
+        return root;
+    }
+
+    function getGlobalBounds(obj) {
+        const bounds = obj.getBounds(true);
+        return { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height, centerX: bounds.x + bounds.width / 2, centerY: bounds.y + bounds.height / 2, left: bounds.x, right: bounds.x + bounds.width, top: bounds.y, bottom: bounds.y + bounds.height };
+    }
+
+    function updateHighlight() {
+        if (!highlightOverlay) {
+            highlightOverlay = document.createElement('div');
+            highlightOverlay.id = 'pixi-center-highlight';
+            highlightOverlay.innerHTML = '<div class="hl-label"></div><div class="hl-info"></div>';
+            document.body.appendChild(highlightOverlay);
+            const style = document.createElement('style');
+            style.textContent = `#pixi-center-highlight{position:fixed;border:3px solid #00BFFF;background:rgba(0,191,255,0.08);pointer-events:none;z-index:999998;display:none;box-sizing:border-box}#pixi-center-highlight .hl-label{position:absolute;bottom:100%;left:-3px;background:#00BFFF;color:#000;font:bold 11px system-ui;padding:2px 8px;border-radius:4px 4px 0 0;white-space:nowrap;max-width:300px;overflow:hidden;text-overflow:ellipsis}#pixi-center-highlight .hl-info{position:absolute;top:100%;left:-3px;background:rgba(0,0,0,0.8);color:#00BFFF;font:10px monospace;padding:2px 6px;border-radius:0 0 4px 4px;white-space:nowrap}`;
+            document.head.appendChild(style);
+        }
+        if (!selectedObject || !selectedObject.worldVisible) { highlightOverlay.style.display = 'none'; return; }
+        const canvas = document.querySelector('canvas');
+        if (!canvas) return;
+        const rect = canvas.getBoundingClientRect();
+        const bounds = getGlobalBounds(selectedObject);
+        const app = getPixiApp();
+        const resolution = app?.renderer?.resolution || 1;
+        const scaleX = rect.width / (canvas.width / resolution), scaleY = rect.height / (canvas.height / resolution);
+        highlightOverlay.style.display = 'block';
+        highlightOverlay.style.left = (rect.left + bounds.x * scaleX) + 'px';
+        highlightOverlay.style.top = (rect.top + bounds.y * scaleY) + 'px';
+        highlightOverlay.style.width = (bounds.width * scaleX) + 'px';
+        highlightOverlay.style.height = (bounds.height * scaleY) + 'px';
+        const label = highlightOverlay.querySelector('.hl-label');
+        if (label) label.textContent = getLabel(selectedObject) + (frozenObjects.has(selectedObject) ? ' ❄' : '');
+        const info = highlightOverlay.querySelector('.hl-info');
+        if (info && lastFoundObjects.length > 1) { info.textContent = `${clickCycleIndex + 1}/${lastFoundObjects.length} · Click to cycle · Shift=parent`; info.style.display = 'block'; }
+        else if (info) info.style.display = 'none';
+    }
+
+    function updateAfterRender() { requestAnimationFrame(() => requestAnimationFrame(() => { updateDeltas(); updateHighlight(); })); }
+
+    function trackObjectMove(obj) {
+        if (!obj) return;
+        if (!movedObjects.has(obj)) movedObjects.set(obj, { name: getLabel(obj), originalX: obj.x || 0, originalY: obj.y || 0, originalSX: obj.scale?.x ?? 1, originalSY: obj.scale?.y ?? 1, x: obj.x || 0, y: obj.y || 0, sx: obj.scale?.x ?? 1, sy: obj.scale?.y ?? 1 });
+        const data = movedObjects.get(obj);
+        data.x = obj.x || 0; data.y = obj.y || 0; data.sx = obj.scale?.x ?? 1; data.sy = obj.scale?.y ?? 1;
+        updateMovedCount();
+    }
+
+    function updateMovedCount() {
+        if (!popup) return;
+        const btn = popup.document.getElementById('copyMoved');
+        if (btn) btn.textContent = movedObjects.size > 0 ? `📋 Copy Moved (${movedObjects.size})` : '📋 Copy Moved';
+    }
+
+    function freezeObject(obj) {
+        if (!obj || frozenObjects.has(obj)) return;
+        const originalState = {};
+        if (obj.state?.timeScale !== undefined) { originalState.stateTimeScale = obj.state.timeScale; obj.state.timeScale = 0; }
+        if (obj.timeScale !== undefined) { originalState.timeScale = obj.timeScale; obj.timeScale = 0; }
+        if (typeof obj.stop === 'function' && typeof obj.play === 'function') { originalState.wasPlaying = obj.playing; obj.stop(); }
+        if (obj.autoUpdate !== undefined) { originalState.autoUpdate = obj.autoUpdate; obj.autoUpdate = false; }
+        if (typeof obj.update === 'function' && !originalState.stateTimeScale) { originalState.updateFn = obj.update; obj.update = function() {}; }
+        const frozenChildren = [];
+        function freezeChildren(node) {
+            if (node.state?.timeScale !== undefined && node !== obj) { frozenChildren.push({ node, timeScale: node.state.timeScale }); node.state.timeScale = 0; }
+            (node.children || []).forEach(freezeChildren);
+        }
+        freezeChildren(obj);
+        if (frozenChildren.length > 0) originalState.frozenChildren = frozenChildren;
+        frozenObjects.set(obj, originalState);
+        updateFreezeButton(); updateHighlight();
+    }
+
+    function unfreezeObject(obj) {
+        if (!obj || !frozenObjects.has(obj)) return;
+        const originalState = frozenObjects.get(obj);
+        if (originalState.stateTimeScale !== undefined && obj.state) obj.state.timeScale = originalState.stateTimeScale;
+        if (originalState.timeScale !== undefined) obj.timeScale = originalState.timeScale;
+        if (originalState.wasPlaying && typeof obj.play === 'function') obj.play();
+        if (originalState.autoUpdate !== undefined) obj.autoUpdate = originalState.autoUpdate;
+        if (originalState.updateFn) obj.update = originalState.updateFn;
+        if (originalState.frozenChildren) originalState.frozenChildren.forEach(({ node, timeScale }) => { if (node.state) node.state.timeScale = timeScale; });
+        frozenObjects.delete(obj);
+        updateFreezeButton(); updateHighlight();
+    }
+
+    function isObjectFrozen(obj) { return frozenObjects.has(obj); }
+
+    function updateFreezeButton() {
+        if (!popup) return;
+        const btn = popup.document.getElementById('freezeBtn');
+        if (!btn) return;
+        if (!selectedObject) { btn.style.opacity = '0.5'; btn.textContent = '❄ Freeze'; btn.classList.remove('frozen'); return; }
+        btn.style.opacity = '1';
+        const frozen = isObjectFrozen(selectedObject);
+        btn.textContent = frozen ? '▶ Unfreeze' : '❄ Freeze';
+        btn.classList.toggle('frozen', frozen);
+    }
+
+    // ========== FREEZE TIMERS (με hooks) ==========
+    function freezeTimers() {
+        if (timersFrozen) return;
+        timersFrozen = true;
+
+        // Hook setTimeout
+        if (!originalSetTimeout) {
+            originalSetTimeout = window.setTimeout;
+            window.setTimeout = function(fn, delay, ...args) {
+                if (timersFrozen) { pendingTimeouts.push({ fn, delay, args }); return -1; }
+                return originalSetTimeout.call(window, fn, delay, ...args);
+            };
+        }
+
+        // Hook setInterval
+        if (!originalSetInterval) {
+            originalSetInterval = window.setInterval;
+            window.setInterval = function(fn, delay, ...args) {
+                if (timersFrozen) { pendingIntervals.push({ fn, delay, args }); return -1; }
+                return originalSetInterval.call(window, fn, delay, ...args);
+            };
+        }
+
+        // PIXI Ticker
+        if (window.__PIXI_APP__?.ticker) {
+            pixiTickerSpeed = window.__PIXI_APP__.ticker.speed;
+            window.__PIXI_APP__.ticker.speed = 0;
+        }
+
+        // GSAP
+        if (window.gsap?.globalTimeline) window.gsap.globalTimeline.timeScale(0);
+
+        updateTimerButton();
+    }
+
+    function unfreezeTimers() {
+        if (!timersFrozen) return;
+        timersFrozen = false;
+
+        // Restore PIXI Ticker
+        if (window.__PIXI_APP__?.ticker && pixiTickerSpeed !== null) window.__PIXI_APP__.ticker.speed = pixiTickerSpeed;
+
+        // Restore GSAP
+        if (window.gsap?.globalTimeline) window.gsap.globalTimeline.timeScale(1);
+
+        // Execute pending timeouts
+        for (const p of pendingTimeouts) originalSetTimeout.call(window, p.fn, p.delay, ...p.args);
+        pendingTimeouts = [];
+
+        // Execute pending intervals
+        for (const p of pendingIntervals) originalSetInterval.call(window, p.fn, p.delay, ...p.args);
+        pendingIntervals = [];
+
+        pixiTickerSpeed = null;
+        updateTimerButton();
+    }
+
+    function updateTimerButton() {
+        if (!popup) return;
+        const btn = popup.document.getElementById('timerBtn');
+        if (!btn) return;
+        btn.textContent = timersFrozen ? '▶ Timers' : '⏱ Timers';
+        btn.classList.toggle('frozen', timersFrozen);
+    }
+
+    function createPopup() {
+        const win = window.open('', 'PIXI Center', 'width=450,height=850,top=100,left=100');
+        if (!win) return alert('Popup blocked!');
+        const doc = win.document;
+        doc.title = 'PIXI Window Center';
+
+        const style = doc.createElement('style');
+        style.textContent = `*{margin:0;padding:0;box-sizing:border-box}body{background:#1a1a1a;color:#e0e0e0;font:13px system-ui,sans-serif;padding:12px;display:flex;flex-direction:column;height:100vh;gap:10px}.header{display:flex;justify-content:space-between;align-items:center;padding-bottom:8px;border-bottom:1px solid #333}.header h1{font-size:15px;color:#00BFFF}.header-btns{display:flex;gap:6px}.lock-btn,.clear-btn{padding:4px 12px;background:#333;border:1px solid #555;color:#e0e0e0;border-radius:4px;cursor:pointer;font-size:12px}.lock-btn.active{background:#00BFFF;color:#000}.clear-btn:hover{background:#f44336;border-color:#f44336}.tree{flex:1;overflow-y:auto;background:#252525;border-radius:6px;padding:8px;min-height:120px}.tree-item{padding:3px 4px;cursor:pointer;border-radius:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px}.tree-item:hover{background:#333}.tree-item.selected{background:#00BFFF;color:#000;font-weight:bold}.tree-item.invisible{opacity:0.4;font-style:italic}.tree-item.moved{border-left:3px solid #4CAF50}.tree-item.frozen{border-right:3px solid #2196F3}.arrow{display:inline-block;width:14px;color:#888;cursor:pointer;user-select:none}.arrow:hover{color:#fff}.info{background:#252525;border-radius:6px;padding:10px}.info-row{display:flex;justify-content:space-between;align-items:center;padding:3px 0;border-bottom:1px solid #333}.info-row:last-child{border-bottom:none}.info-label{color:#888;font-size:12px}.info-value{color:#00BFFF;font-family:monospace;font-size:12px}.info-buttons{display:flex;gap:4px;flex-wrap:wrap}.toggle-btn{padding:4px 10px;background:#4CAF50;border:none;color:#fff;border-radius:4px;cursor:pointer;font-weight:bold;font-size:10px}.toggle-btn.off{background:#f44336}.freeze-btn,.timer-btn{padding:4px 10px;background:#2196F3;border:none;color:#fff;border-radius:4px;cursor:pointer;font-weight:bold;font-size:10px}.freeze-btn.frozen,.timer-btn.frozen{background:#FF9800}.freeze-btn:hover,.timer-btn:hover{opacity:0.9}.deltas{background:#252525;border-radius:6px;padding:10px;display:grid;grid-template-columns:repeat(3,1fr);gap:6px}.delta-item{text-align:center}.delta-label{font-size:9px;color:#888;margin-bottom:2px}.delta-value{font-size:13px;font-weight:bold;color:#00BFFF;font-family:monospace}.delta-value.zero{color:#4CAF50}.transforms{background:#252525;border-radius:6px;padding:10px;display:grid;grid-template-columns:1fr 1fr;gap:6px}.input-group{display:flex;align-items:center;gap:4px}.input-group label{width:22px;font-size:11px;color:#888;font-weight:600}.input-group input{flex:1;background:#333;border:1px solid #444;color:#e0e0e0;padding:5px 6px;border-radius:4px;font:11px monospace}.scrub{padding:5px 6px;background:#444;border-radius:4px;cursor:ns-resize;user-select:none;font-size:10px;color:#888}.scrub:hover{background:#555;color:#fff}.scrub:active{background:#00BFFF;color:#000}.buttons{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}.buttons button{padding:8px;background:#00BFFF;border:none;color:#000;border-radius:6px;cursor:pointer;font-weight:bold;font-size:12px}.buttons button:hover{background:#00a0d0}.copy-section{display:flex;justify-content:center;gap:8px}.copy-btn{padding:6px 14px;background:#333;border:1px solid #555;color:#e0e0e0;border-radius:4px;cursor:pointer;font-size:12px}.copy-btn:hover{background:#444}.copy-btn.copied{background:#4CAF50;color:#fff;border-color:#4CAF50}.footer{text-align:center;color:#666;font-size:9px;line-height:1.4}.footer .key{background:#333;padding:1px 4px;border-radius:3px;color:#fff}`;
+        doc.head.appendChild(style);
+
+        const app = getPixiApp();
+        if (!app) { doc.body.innerHTML = '<div style="color:#f55;padding:20px;">PIXI app not found!</div>'; popup = win; return; }
+
+        doc.body.innerHTML = `<div class="header"><h1>⊕ PIXI Window Center</h1><div class="header-btns"><button class="clear-btn" id="clearMoved" title="Clear moved list">🗑</button><button class="lock-btn" id="lockBtn">Lock OFF</button></div></div><div class="tree" id="tree"></div><div class="info"><div class="info-row"><span class="info-label">Name</span><span class="info-value" id="infoName">-</span></div><div class="info-row"><span class="info-label">Pos</span><span class="info-value" id="infoPos">-</span></div><div class="info-row"><span class="info-label">Controls</span><div class="info-buttons"><button class="toggle-btn" id="toggleVis">ON</button><button class="freeze-btn" id="freezeBtn">❄ Freeze</button><button class="timer-btn" id="timerBtn">⏱ Timers</button></div></div></div><div class="deltas"><div class="delta-item"><div class="delta-label">ΔX</div><div class="delta-value" id="deltaX">0.0</div></div><div class="delta-item"><div class="delta-label">ΔY</div><div class="delta-value" id="deltaY">0.0</div></div><div class="delta-item"><div class="delta-label">LEFT</div><div class="delta-value" id="deltaLeft">0.0</div></div><div class="delta-item"><div class="delta-label">RIGHT</div><div class="delta-value" id="deltaRight">0.0</div></div><div class="delta-item"><div class="delta-label">TOP</div><div class="delta-value" id="deltaTop">0.0</div></div><div class="delta-item"><div class="delta-label">BOTTOM</div><div class="delta-value" id="deltaBottom">0.0</div></div></div><div class="transforms"><div class="input-group"><label>X</label><input id="inp-x" type="number" step="1"><span class="scrub" data-axis="x">↕</span></div><div class="input-group"><label>Y</label><input id="inp-y" type="number" step="1"><span class="scrub" data-axis="y">↕</span></div><div class="input-group"><label>SX</label><input id="inp-sx" type="number" step="0.01"><span class="scrub" data-axis="sx">↕</span></div><div class="input-group"><label>SY</label><input id="inp-sy" type="number" step="0.01"><span class="scrub" data-axis="sy">↕</span></div></div><div class="buttons"><button id="centerX">Center X</button><button id="centerBoth">Center</button><button id="centerY">Center Y</button></div><div class="copy-section"><button class="copy-btn" id="copyMoved">📋 Copy Moved</button></div><div class="footer"><span class="key">Click</span> select · <span class="key">Click again</span> cycle · <span class="key">Shift+Click</span> parent · <span class="key">Alt+2</span></div>`;
+
+        doc.getElementById('lockBtn').onclick = () => { isLocked = !isLocked; const btn = doc.getElementById('lockBtn'); btn.textContent = isLocked ? 'Lock ON' : 'Lock OFF'; btn.classList.toggle('active', isLocked); };
+        doc.getElementById('clearMoved').onclick = () => { movedObjects.clear(); updateMovedCount(); refreshTree(); };
+        doc.getElementById('toggleVis').onclick = () => { if (!selectedObject) return; selectedObject.visible = !selectedObject.visible; updateInfo(); updateHighlight(); refreshTree(); };
+        doc.getElementById('freezeBtn').onclick = () => { if (!selectedObject) return; isObjectFrozen(selectedObject) ? unfreezeObject(selectedObject) : freezeObject(selectedObject); refreshTree(); };
+        doc.getElementById('timerBtn').onclick = () => { timersFrozen ? unfreezeTimers() : freezeTimers(); };
+
+        const bindScrub = (inputId, axis, step) => {
+            const inp = doc.getElementById(inputId);
+            const scrub = doc.querySelector(`.scrub[data-axis="${axis}"]`);
+            if (!inp || !scrub) return;
+            inp.addEventListener('input', () => {
+                if (!selectedObject) return;
+                const val = parseFloat(inp.value) || 0;
+                if (axis === 'x') selectedObject.x = val;
+                else if (axis === 'y') selectedObject.y = val;
+                else if (axis === 'sx') { if (!selectedObject.scale) selectedObject.scale = {x:1,y:1}; selectedObject.scale.x = val; }
+                else if (axis === 'sy') { if (!selectedObject.scale) selectedObject.scale = {x:1,y:1}; selectedObject.scale.y = val; }
+                trackObjectMove(selectedObject); updateAfterRender(); refreshTree();
+            });
+            let startY = 0, startVal = 0;
+            scrub.addEventListener('pointerdown', (e) => {
+                if (!selectedObject) return;
+                e.preventDefault(); startY = e.clientY; startVal = parseFloat(inp.value) || 0;
+                const move = (ev) => {
+                    const newVal = startVal + (startY - ev.clientY) * step;
+                    inp.value = newVal.toFixed(axis.startsWith('s') ? 3 : 2);
+                    if (axis === 'x') selectedObject.x = newVal;
+                    else if (axis === 'y') selectedObject.y = newVal;
+                    else if (axis === 'sx') { if (!selectedObject.scale) selectedObject.scale = {x:1,y:1}; selectedObject.scale.x = newVal; }
+                    else if (axis === 'sy') { if (!selectedObject.scale) selectedObject.scale = {x:1,y:1}; selectedObject.scale.y = newVal; }
+                    trackObjectMove(selectedObject); updateAfterRender();
+                };
+                const up = () => { win.removeEventListener('pointermove', move); win.removeEventListener('pointerup', up); refreshTree(); };
+                win.addEventListener('pointermove', move); win.addEventListener('pointerup', up);
+            });
+        };
+        bindScrub('inp-x', 'x', 1); bindScrub('inp-y', 'y', 1); bindScrub('inp-sx', 'sx', 0.01); bindScrub('inp-sy', 'sy', 0.01);
+
+        doc.getElementById('centerX').onclick = () => { centerObject('x'); trackObjectMove(selectedObject); refreshTree(); };
+        doc.getElementById('centerY').onclick = () => { centerObject('y'); trackObjectMove(selectedObject); refreshTree(); };
+        doc.getElementById('centerBoth').onclick = () => { centerObject('both'); trackObjectMove(selectedObject); refreshTree(); };
+
+        doc.getElementById('copyMoved').onclick = function() {
+            if (movedObjects.size === 0) { alert('No objects have been moved yet!'); return; }
+            const allMoved = [];
+            movedObjects.forEach((data) => { allMoved.push({ name: data.name, x: parseFloat(data.x.toFixed(2)), y: parseFloat(data.y.toFixed(2)), sx: parseFloat(data.sx.toFixed(3)), sy: parseFloat(data.sy.toFixed(3)), deltaX: parseFloat((data.x - data.originalX).toFixed(2)), deltaY: parseFloat((data.y - data.originalY).toFixed(2)) }); });
+            const text = JSON.stringify(allMoved, null, 2);
+            try { const ta = doc.createElement('textarea'); ta.value = text; ta.style.cssText = 'position:fixed;opacity:0'; doc.body.appendChild(ta); ta.select(); doc.execCommand('copy'); doc.body.removeChild(ta); this.textContent = `✓ Copied ${allMoved.length}!`; this.classList.add('copied'); setTimeout(() => { updateMovedCount(); this.classList.remove('copied'); }, 1500); }
+            catch { win.prompt('Copy this:', text); }
+        };
+
+        doc.getElementById('tree').onclick = (e) => {
+            const arrow = e.target.closest('.arrow');
+            if (arrow?.dataset.path) { const p = arrow.dataset.path; openPaths.has(p) ? openPaths.delete(p) : openPaths.add(p); refreshTree(); return; }
+            const item = e.target.closest('.tree-item');
+            if (item?.dataset.path) { const nodes = collectAll(app.stage); const node = nodes.find(n => n.path === item.dataset.path); if (node) selectObject(node.obj, true); }
+        };
+
+        popup = win;
+        refreshTree(); updateMovedCount(); updateTimerButton();
+        win.onunload = () => { popup = null; if (highlightOverlay) highlightOverlay.style.display = 'none'; };
+    }
+
+    function refreshTree() {
+        if (!popup) return;
+        const app = getPixiApp(); if (!app) return;
+        const tree = popup.document.getElementById('tree'); if (!tree) return;
+        tree.innerHTML = '';
+        const nodes = collectAll(app.stage);
+        const root = buildTree(nodes);
+        function renderNode(node, depth = 0) {
+            const frag = popup.document.createDocumentFragment();
+            const isOpen = openPaths.has(node.path), hasChildren = node.children.size > 0;
+            if (node.path !== 'stage') {
+                const div = popup.document.createElement('div'); div.className = 'tree-item'; div.dataset.path = node.path; div.style.paddingLeft = (depth * 12) + 'px';
+                if (node.obj === selectedObject) div.classList.add('selected');
+                if (node.obj && (node.obj.visible === false || node.obj.worldVisible === false)) div.classList.add('invisible');
+                if (node.obj && movedObjects.has(node.obj)) div.classList.add('moved');
+                if (node.obj && frozenObjects.has(node.obj)) div.classList.add('frozen');
+                const frozenIcon = node.obj && frozenObjects.has(node.obj) ? ' ❄' : '';
+                div.innerHTML = `<span class="arrow" data-path="${node.path}">${hasChildren ? (isOpen ? '▾' : '▸') : '·'}</span>${node.label}${frozenIcon}`;
+                frag.appendChild(div);
+            }
+            if (isOpen || node.path === 'stage') node.children.forEach(child => frag.appendChild(renderNode(child, node.path === 'stage' ? 0 : depth + 1)));
+            return frag;
+        }
+        tree.appendChild(renderNode(root));
+        if (selectedObject) { const sel = tree.querySelector('.selected'); if (sel) sel.scrollIntoView({ block: 'center', behavior: 'smooth' }); }
+    }
+
+    function selectObject(obj, openAncestors = false) {
+        if (isLocked) return;
+        selectedObject = obj;
+        openPaths.clear(); openPaths.add('stage');
+        if (obj) { const app = getPixiApp(); const nodes = collectAll(app.stage); const node = nodes.find(n => n.obj === obj); if (node) { let acc = 'stage'; node.path.split('/').slice(1).forEach(p => { acc += `/${p}`; openPaths.add(acc); }); } }
+        updateInfo(); updateDeltas(); updateHighlight(); updateFreezeButton(); refreshTree();
+    }
+
+    function getParent(obj) { if (!obj?.parent) return null; const app = getPixiApp(); if (obj.parent === app.stage) return null; return obj.parent; }
+
+    function updateInfo() {
+        if (!popup || !selectedObject) return;
+        const doc = popup.document;
+        doc.getElementById('infoName').textContent = getLabel(selectedObject) + (frozenObjects.has(selectedObject) ? ' ❄' : '');
+        doc.getElementById('infoPos').textContent = `${(selectedObject.x || 0).toFixed(1)}, ${(selectedObject.y || 0).toFixed(1)}`;
+        const visBtn = doc.getElementById('toggleVis'); visBtn.textContent = selectedObject.visible !== false ? 'ON' : 'OFF'; visBtn.classList.toggle('off', selectedObject.visible === false);
+        doc.getElementById('inp-x').value = (selectedObject.x || 0).toFixed(2);
+        doc.getElementById('inp-y').value = (selectedObject.y || 0).toFixed(2);
+        doc.getElementById('inp-sx').value = (selectedObject.scale?.x ?? 1).toFixed(3);
+        doc.getElementById('inp-sy').value = (selectedObject.scale?.y ?? 1).toFixed(3);
+        updateFreezeButton();
+    }
+
+    function updateDeltas() {
+        if (!popup) return;
+        const doc = popup.document, app = getPixiApp(); if (!app) return;
+        const setVal = (id, val) => { const el = doc.getElementById(id); if (!el) return; const num = parseFloat(val) || 0; el.textContent = num.toFixed(1); el.className = 'delta-value' + (Math.abs(num) < 0.5 ? ' zero' : ''); };
+        if (!selectedObject) { ['deltaX', 'deltaY', 'deltaLeft', 'deltaRight', 'deltaTop', 'deltaBottom'].forEach(id => setVal(id, 0)); return; }
+        const bounds = getGlobalBounds(selectedObject), screenW = app.renderer.width, screenH = app.renderer.height;
+        setVal('deltaX', bounds.centerX - screenW / 2); setVal('deltaY', bounds.centerY - screenH / 2);
+        setVal('deltaLeft', bounds.left); setVal('deltaRight', screenW - bounds.right);
+        setVal('deltaTop', bounds.top); setVal('deltaBottom', screenH - bounds.bottom);
+    }
+
+    function centerObject(axis) {
+        if (!selectedObject) return;
+        const app = getPixiApp(); if (!app) return;
+        const bounds = getGlobalBounds(selectedObject), screenCX = app.renderer.width / 2, screenCY = app.renderer.height / 2;
+        if (axis === 'x' || axis === 'both') selectedObject.x += screenCX - bounds.centerX;
+        if (axis === 'y' || axis === 'both') selectedObject.y += screenCY - bounds.centerY;
+        updateInfo(); updateAfterRender();
+    }
+
+    function enableCanvasSelection() {
+        const canvas = document.querySelector('canvas'); if (!canvas) return;
+        canvas.addEventListener('click', (e) => {
+            if (!isSelecting || isLocked) return;
+            const app = getPixiApp(); if (!app) return;
+            if (e.shiftKey && selectedObject) { const parent = getParent(selectedObject); if (parent) { selectObject(parent, true); lastFoundObjects = []; clickCycleIndex = 0; } return; }
+            const rect = canvas.getBoundingClientRect(), res = app.renderer.resolution || 1;
+            const x = (e.clientX - rect.left) * (canvas.width / res) / rect.width, y = (e.clientY - rect.top) * (canvas.height / res) / rect.height;
+            const now = Date.now(), samePos = Math.abs(x - lastClickPos.x) < 10 && Math.abs(y - lastClickPos.y) < 10, quick = (now - lastClickTime) < 1000;
+            const nodes = collectAll(app.stage), found = [];
+            for (let i = nodes.length - 1; i >= 0; i--) { const obj = nodes[i].obj; if (!obj.worldVisible || isGenericName(getLabel(obj))) continue; try { const b = obj.getBounds(); if (b && x >= b.x && x <= b.x + b.width && y >= b.y && y <= b.y + b.height) found.push(obj); } catch {} }
+            if (found.length === 0) return;
+            found.sort((a, b) => { try { const ba = a.getBounds(), bb = b.getBounds(); return (ba.width * ba.height) - (bb.width * bb.height); } catch { return 0; } });
+            if (samePos && quick && found.length > 1) clickCycleIndex = (clickCycleIndex + 1) % found.length; else clickCycleIndex = 0;
+            lastClickPos = { x, y }; lastClickTime = now; lastFoundObjects = found;
+            selectObject(found[clickCycleIndex], true);
+        });
+    }
+
+    document.addEventListener('keydown', (e) => { if (e.altKey && e.key === '2') { e.preventDefault(); if (!popup || popup.closed) { createPopup(); enableCanvasSelection(); } else popup.focus(); isSelecting = true; } });
+    setInterval(() => { if (popup && !popup.closed && selectedObject) updateHighlight(); }, 100);
+})();
