@@ -33,6 +33,9 @@
         const MAX_FLOW = 200;
         const MAX_FLOW_DISPLAY = 100;
         const MAX_RECEIVERS = 100;
+        const MAX_TREE_ITEMS = 50;
+        const MIN_PANEL_WIDTH = 150;
+        const MAX_PANEL_WIDTH = 600;
 
         // Utility Functions
         function getPixiApp() {
@@ -690,7 +693,7 @@
             <button id="flowBtn" class="view-tab active">📊 Execution Flow</button>
             <button id="helpBtn" class="view-tab">📖 How to Use</button>
         </div>
-        <input id="searchBox" class="search-box" placeholder="Search...">
+        <input id="searchBox" class="search-box" placeholder="Search actors, actions, triggers...">
         <div style="flex:1"></div>
         <button id="compactBtn" class="header-btn">🔲 Compact</button>
         <button id="pauseBtn" class="header-btn">⏸️ Pause</button>
@@ -829,7 +832,7 @@
                 if (!isResizing) return;
                 const diff = e.clientX - startX;
                 const newWidth = startWidth + diff;
-                if (newWidth > 150 && newWidth < 600) {
+                if (newWidth > MIN_PANEL_WIDTH && newWidth < MAX_PANEL_WIDTH) {
                     treePanel.style.width = newWidth + 'px';
                 }
             };
@@ -932,7 +935,7 @@
                 \`;
 
                 if (isExpanded) {
-                    filteredItems.slice(0, 50).forEach(item => {
+                    filteredItems.slice(0, MAX_TREE_ITEMS).forEach(item => {
                         const isRecent = now - item.time < 3000;
                         const isItemSelected = selectedItem === item;
                         const itemIndex = executionFlow.indexOf(item);
