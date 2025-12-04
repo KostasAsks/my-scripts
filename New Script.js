@@ -723,22 +723,23 @@
 
             tracerWindow.document.close();
             
-            // Add global functions to tracerWindow for tree interaction
-            tracerWindow.toggleActor = (actor) => {
-                if (expandedActors.has(actor)) {
-                    expandedActors.delete(actor);
-                } else {
-                    expandedActors.add(actor);
+            // Store functions in a safe namespace instead of global
+            tracerWindow.__analyzerHandlers = {
+                toggleActor: (actor) => {
+                    if (expandedActors.has(actor)) {
+                        expandedActors.delete(actor);
+                    } else {
+                        expandedActors.add(actor);
+                    }
+                    selectedActor = actor;
+                    selectedItem = null;
+                    renderContent();
+                },
+                selectItem: (index) => {
+                    selectedItem = executionFlow[index];
+                    selectedActor = selectedItem ? selectedItem.actor : null;
+                    renderContent();
                 }
-                selectedActor = actor;
-                selectedItem = null;
-                renderContent();
-            };
-
-            tracerWindow.selectItem = (index) => {
-                selectedItem = executionFlow[index];
-                selectedActor = selectedItem ? selectedItem.actor : null;
-                renderContent();
             };
 
             setTimeout(() => { setupWindowEvents(); renderContent(); }, 100);
@@ -812,15 +813,22 @@
             const resizer = doc.getElementById('resizer');
             const treePanel = doc.querySelector('.tree-panel');
             let isResizing = false;
+            let startX = 0;
+            let startWidth = 0;
 
             resizer.onmousedown = (e) => {
                 isResizing = true;
+                startX = e.clientX;
+                startWidth = treePanel.offsetWidth;
                 doc.body.style.cursor = 'col-resize';
+                doc.body.style.userSelect = 'none';
+                e.preventDefault();
             };
 
             doc.onmousemove = (e) => {
                 if (!isResizing) return;
-                const newWidth = e.clientX;
+                const diff = e.clientX - startX;
+                const newWidth = startWidth + diff;
                 if (newWidth > 150 && newWidth < 600) {
                     treePanel.style.width = newWidth + 'px';
                 }
@@ -830,8 +838,25 @@
                 if (isResizing) {
                     isResizing = false;
                     doc.body.style.cursor = '';
+                    doc.body.style.userSelect = '';
                 }
             };
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function formatActionName(action) {
+            return String(action).replace(/^action-/, '').split('-')
+                .map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+        }
+
+        function formatTriggerName(trigger) {
+            return String(trigger || 'Unknown').replace(/^on-/i, '').replace(/-/g, ' ')
+                .split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
         }
 
         function getUniqueActors() {
@@ -893,13 +918,14 @@
                 const isExpanded = expandedActors.has(actor);
                 const isSelected = selectedActor === actor;
                 const count = items.length;
+                const actorDisplay = escapeHtml(actor.replace(/^actor-/, ''));
 
                 html += \`
                     <div class="tree-actor-group">
-                        <div class="tree-actor-header \${isSelected ? 'selected' : ''}" onclick="window.toggleActor('\${actor}')">
+                        <div class="tree-actor-header \${isSelected ? 'selected' : ''}" data-actor="\${escapeHtml(actor)}">
                             <span class="tree-expand-icon \${isExpanded ? 'expanded' : ''}">▶</span>
                             <div class="tree-actor-dot" style="background:\${color}"></div>
-                            <div class="tree-actor-name">\${actor.replace(/^actor-/, '')}</div>
+                            <div class="tree-actor-name">\${actorDisplay}</div>
                             <span class="tree-badge">\${count}</span>
                         </div>
                         <div class="tree-children \${isExpanded ? 'expanded' : ''}">
@@ -909,23 +935,24 @@
                     filteredItems.slice(0, 50).forEach(item => {
                         const isRecent = now - item.time < 3000;
                         const isItemSelected = selectedItem === item;
+                        const itemIndex = executionFlow.indexOf(item);
                         
                         if (item.type === 'action') {
-                            const actionName = String(item.name).replace(/^action-/, '').split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+                            const actionName = escapeHtml(formatActionName(item.name));
                             html += \`
                                 <div class="tree-item \${isRecent ? 'recent' : ''} \${isItemSelected ? 'selected' : ''}" 
-                                     onclick="window.selectItem(\${executionFlow.indexOf(item)})">
+                                     data-item-index="\${itemIndex}">
                                     <span class="tree-item-icon">🎬</span>
                                     <span class="tree-item-text">\${actionName}</span>
                                     <span class="tree-item-type action">A</span>
                                 </div>
                             \`;
                         } else if (item.type === 'trigger') {
-                            const triggerName = String(item.trigger || 'Unknown').replace(/^on-/i, '').replace(/-/g, ' ').split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+                            const triggerName = escapeHtml(formatTriggerName(item.trigger));
                             const icon = getTriggerIcon(item.trigger);
                             html += \`
                                 <div class="tree-item \${isRecent ? 'recent' : ''} \${isItemSelected ? 'selected' : ''}" 
-                                     onclick="window.selectItem(\${executionFlow.indexOf(item)})">
+                                     data-item-index="\${itemIndex}">
                                     <span class="tree-item-icon">\${icon}</span>
                                     <span class="tree-item-text">\${triggerName}</span>
                                     <span class="tree-item-type trigger">T</span>
@@ -942,6 +969,26 @@
             });
 
             container.innerHTML = html;
+
+            // Add event delegation for tree interactions
+            container.onclick = (e) => {
+                const actorHeader = e.target.closest('.tree-actor-header');
+                if (actorHeader) {
+                    const actor = actorHeader.getAttribute('data-actor');
+                    if (actor && tracerWindow.__analyzerHandlers) {
+                        tracerWindow.__analyzerHandlers.toggleActor(actor);
+                    }
+                    return;
+                }
+
+                const treeItem = e.target.closest('.tree-item');
+                if (treeItem) {
+                    const itemIndex = parseInt(treeItem.getAttribute('data-item-index'), 10);
+                    if (!isNaN(itemIndex) && tracerWindow.__analyzerHandlers) {
+                        tracerWindow.__analyzerHandlers.selectItem(itemIndex);
+                    }
+                }
+            };
         }
 
         function renderDetails() {
@@ -987,7 +1034,8 @@
                 const params = formatParams(item.params || item.state);
 
                 if (item.type === 'action') {
-                    const actionName = String(item.name).replace(/^action-/, '').split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+                    const actionName = escapeHtml(formatActionName(item.name));
+                    const actorDisplay = escapeHtml(item.actor.replace(/^actor-/, ''));
                     html += \`
                         <div class="flow-item \${isRecent ? 'recent' : ''}">
                             <div class="flow-time-col"><div class="flow-time">\${getRelativeTime(item.time)}</div></div>
@@ -1000,21 +1048,23 @@
                                     <span class="flow-type-badge action">ACTION</span>
                                     <div class="flow-header-row">
                                         <div class="flow-actor-dot" style="background:\${color}"></div>
-                                        <div class="flow-actor-name">\${item.actor.replace(/^actor-/, '')}</div>
+                                        <div class="flow-actor-name">\${actorDisplay}</div>
                                     </div>
                                     <div class="flow-header-row">
                                         <div class="flow-icon">🎬</div>
                                         <div class="flow-name">\${actionName}</div>
                                     </div>
-                                    \${params ? '<div class="flow-params">' + params + '</div>' : ''}
+                                    \${params ? '<div class="flow-params">' + escapeHtml(params) + '</div>' : ''}
                                 </div>
                             </div>
                         </div>
                     \`;
                 } else if (item.type === 'trigger') {
-                    const triggerName = String(item.trigger || 'Unknown').replace(/^on-/i, '').replace(/-/g, ' ').split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+                    const triggerName = escapeHtml(formatTriggerName(item.trigger));
+                    const actorDisplay = escapeHtml(item.actor);
                     const icon = getTriggerIcon(item.trigger);
                     const receivers = item.receivers || [];
+                    const receiversText = receivers.slice(0, 3).map(r => escapeHtml(r)).join(', ') + (receivers.length > 3 ? '...' : '');
                     html += \`
                         <div class="flow-item \${isRecent ? 'recent' : ''}">
                             <div class="flow-time-col"><div class="flow-time">\${getRelativeTime(item.time)}</div></div>
@@ -1027,14 +1077,14 @@
                                     <span class="flow-type-badge trigger">TRIGGER</span>
                                     <div class="flow-header-row">
                                         <div class="flow-actor-dot" style="background:#8b5cf6"></div>
-                                        <div class="flow-actor-name">\${item.actor}</div>
+                                        <div class="flow-actor-name">\${actorDisplay}</div>
                                     </div>
                                     <div class="flow-header-row">
                                         <div class="flow-icon">\${icon}</div>
                                         <div class="flow-name">\${triggerName}</div>
                                     </div>
-                                    \${receivers.length > 0 ? '<div class="flow-receivers">→ ' + receivers.length + ' receivers: ' + receivers.slice(0, 3).join(', ') + (receivers.length > 3 ? '...' : '') + '</div>' : ''}
-                                    \${params ? '<div class="flow-params">' + params + '</div>' : ''}
+                                    \${receivers.length > 0 ? '<div class="flow-receivers">→ ' + receivers.length + ' receivers: ' + receiversText + '</div>' : ''}
+                                    \${params ? '<div class="flow-params">' + escapeHtml(params) + '</div>' : ''}
                                 </div>
                             </div>
                         </div>
@@ -1090,7 +1140,7 @@
                     <div class="stat-list">
                         \${topActors.map(([actor, count]) => \`
                             <div class="stat-list-item">
-                                <div class="stat-list-label">\${actor.replace(/^actor-/, '')}</div>
+                                <div class="stat-list-label">\${escapeHtml(actor.replace(/^actor-/, ''))}</div>
                                 <div class="stat-list-value">\${count}</div>
                             </div>
                         \`).join('')}
