@@ -25,11 +25,17 @@
         let isInitialized = false;
         let currentView = 'flow';
         let selectedItem = null;
+        let selectedActor = null;
         let pixiApp = null;
         let highlightOverlay = null;
+        let isCompactMode = false;
+        const expandedActors = new Set();
         const MAX_FLOW = 200;
         const MAX_FLOW_DISPLAY = 100;
         const MAX_RECEIVERS = 100;
+        const MAX_TREE_ITEMS = 50;
+        const MIN_PANEL_WIDTH = 150;
+        const MAX_PANEL_WIDTH = 600;
 
         // Utility Functions
         function getPixiApp() {
@@ -106,7 +112,7 @@
         function createTracerWindow() {
             if (tracerWindow && !tracerWindow.closed) { tracerWindow.focus(); return; }
             const gameName = detectGameName();
-            tracerWindow = window.open('', 'UnifiedFlowAnalyzer', 'width=1600,height=1000,left=50,top=50');
+            tracerWindow = window.open('', 'UnifiedFlowAnalyzer', 'width=900,height=600,left=50,top=50');
 
             tracerWindow.document.write(\`<!DOCTYPE html>
 <html>
@@ -118,7 +124,7 @@
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
             font-family: 'Inter', system-ui, sans-serif;
-            font-size: 13px;
+            font-size: 12px;
             background: linear-gradient(135deg, #0f0e1a 0%, #1a1a2e 50%, #16213e 100%);
             color: #e8e8e8;
             height: 100vh;
@@ -129,46 +135,55 @@
 
         /* Header */
         .header {
-            padding: 14px 24px;
+            padding: 8px 16px;
             background: rgba(0,0,0,0.5);
             backdrop-filter: blur(15px);
             border-bottom: 2px solid rgba(123,97,255,0.3);
             display: flex;
-            gap: 16px;
+            gap: 12px;
             align-items: center;
             box-shadow: 0 4px 20px rgba(0,0,0,0.3);
         }
-        .brand { display: flex; align-items: center; gap: 12px; }
-        .logo { font-size: 32px; }
+        body.compact .header {
+            padding: 6px 12px;
+            gap: 8px;
+        }
+        .brand { display: flex; align-items: center; gap: 8px; }
+        .logo { font-size: 24px; }
+        body.compact .logo { font-size: 20px; }
         .title {
-            font-weight: 700; font-size: 20px;
+            font-weight: 700; font-size: 16px;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             letter-spacing: -0.5px;
         }
+        body.compact .title { font-size: 14px; }
         .game-badge {
             background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
-            color: #000; padding: 6px 16px; border-radius: 20px;
-            font-size: 12px; font-weight: 600; text-transform: uppercase;
+            color: #000; padding: 4px 12px; border-radius: 16px;
+            font-size: 11px; font-weight: 600; text-transform: uppercase;
             letter-spacing: 0.5px;
         }
+        body.compact .game-badge { padding: 3px 10px; font-size: 10px; }
         .status-pill {
-            padding: 7px 18px; border-radius: 20px;
-            font-size: 11px; font-weight: 600;
-            display: flex; align-items: center; gap: 8px;
+            padding: 5px 14px; border-radius: 16px;
+            font-size: 10px; font-weight: 600;
+            display: flex; align-items: center; gap: 6px;
         }
+        body.compact .status-pill { padding: 4px 10px; font-size: 9px; }
         .status-pill.recording { background: linear-gradient(135deg, #00b894 0%, #00cec9 100%); color: #000; }
         .status-pill.paused { background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%); color: #fff; }
         .status-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; animation: pulse 1.5s infinite; }
         @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.5; transform: scale(0.9); } }
 
-        .view-tabs { display: flex; background: rgba(255,255,255,0.05); border-radius: 12px; padding: 4px; gap: 4px; }
+        .view-tabs { display: flex; background: rgba(255,255,255,0.05); border-radius: 10px; padding: 3px; gap: 3px; }
         .view-tab {
             background: transparent; border: none; color: rgba(255,255,255,0.6);
-            padding: 8px 20px; cursor: pointer; font: inherit; font-weight: 500;
-            border-radius: 8px; transition: all 0.2s; font-size: 13px;
+            padding: 6px 14px; cursor: pointer; font: inherit; font-weight: 500;
+            border-radius: 7px; transition: all 0.2s; font-size: 11px;
         }
+        body.compact .view-tab { padding: 4px 10px; font-size: 10px; }
         .view-tab:hover { color: #fff; background: rgba(255,255,255,0.05); }
         .view-tab.active {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -177,29 +192,225 @@
 
         .search-box {
             background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15);
-            color: #fff; padding: 9px 18px; border-radius: 10px; width: 240px; font: inherit;
+            color: #fff; padding: 6px 12px; border-radius: 8px; width: 180px; font: inherit;
+            font-size: 11px;
         }
+        body.compact .search-box { padding: 4px 10px; width: 140px; font-size: 10px; }
         .search-box:focus { outline: none; border-color: #667eea; background: rgba(255,255,255,0.12); }
         .search-box::placeholder { color: rgba(255,255,255,0.4); }
 
         .header-btn {
             background: rgba(255,255,255,0.08); color: #fff;
-            border: 1px solid rgba(255,255,255,0.15); border-radius: 10px;
-            padding: 9px 18px; cursor: pointer; font: inherit; font-weight: 500;
-            transition: all 0.2s;
+            border: 1px solid rgba(255,255,255,0.15); border-radius: 8px;
+            padding: 6px 12px; cursor: pointer; font: inherit; font-weight: 500;
+            transition: all 0.2s; font-size: 11px;
         }
+        body.compact .header-btn { padding: 4px 10px; font-size: 10px; }
         .header-btn:hover { background: rgba(255,255,255,0.15); transform: translateY(-1px); }
         .header-btn.danger { background: rgba(231, 76, 60, 0.2); border-color: rgba(231, 76, 60, 0.4); color: #ff6b6b; }
 
         /* Main Content */
         .main { flex: 1; display: flex; overflow: hidden; }
 
+        /* Two Panel Layout */
+        .tree-panel {
+            width: 320px;
+            min-width: 200px;
+            background: rgba(0,0,0,0.2);
+            border-right: 1px solid rgba(255,255,255,0.1);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        .tree-header {
+            padding: 10px 12px;
+            background: rgba(0,0,0,0.3);
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+        body.compact .tree-header { padding: 8px 10px; }
+        .tree-title {
+            font-weight: 600;
+            font-size: 11px;
+            color: rgba(255,255,255,0.6);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            flex: 1;
+        }
+        .tree-btn {
+            background: rgba(255,255,255,0.08);
+            border: 1px solid rgba(255,255,255,0.1);
+            color: rgba(255,255,255,0.7);
+            padding: 4px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 10px;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+        .tree-btn:hover { background: rgba(255,255,255,0.15); }
+        .tree-container {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px;
+        }
+        .tree-container::-webkit-scrollbar { width: 6px; }
+        .tree-container::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 3px; }
+
+        .resizer {
+            width: 4px;
+            background: rgba(255,255,255,0.05);
+            cursor: col-resize;
+            transition: background 0.2s;
+        }
+        .resizer:hover { background: rgba(123,97,255,0.3); }
+
+        .details-panel {
+            flex: 1;
+            background: rgba(0,0,0,0.2);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
         /* Unified Flow View */
         .flow-container {
-            flex: 1; padding: 24px; overflow-y: auto; background: rgba(0,0,0,0.2);
+            flex: 1; padding: 16px; overflow-y: auto; background: rgba(0,0,0,0.2);
         }
+        body.compact .flow-container { padding: 12px; }
         .flow-container::-webkit-scrollbar { width: 8px; }
         .flow-container::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 4px; }
+
+        /* Tree View */
+        .tree-actor-group {
+            margin-bottom: 4px;
+        }
+        .tree-actor-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 8px;
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        body.compact .tree-actor-header { padding: 4px 6px; }
+        .tree-actor-header:hover {
+            background: rgba(255,255,255,0.08);
+            border-color: rgba(255,255,255,0.2);
+        }
+        .tree-actor-header.selected {
+            background: rgba(102, 126, 234, 0.15);
+            border-color: rgba(102, 126, 234, 0.4);
+        }
+        .tree-expand-icon {
+            font-size: 10px;
+            color: rgba(255,255,255,0.5);
+            transition: transform 0.2s;
+            width: 12px;
+        }
+        .tree-expand-icon.expanded { transform: rotate(90deg); }
+        .tree-actor-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+        }
+        .tree-actor-name {
+            font-size: 11px;
+            font-weight: 600;
+            color: rgba(255,255,255,0.8);
+            flex: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        body.compact .tree-actor-name { font-size: 10px; }
+        .tree-badge {
+            background: rgba(255,255,255,0.1);
+            padding: 2px 6px;
+            border-radius: 8px;
+            font-size: 9px;
+            color: rgba(255,255,255,0.6);
+            font-weight: 600;
+        }
+        body.compact .tree-badge { padding: 1px 5px; font-size: 8px; }
+        .tree-children {
+            margin-left: 16px;
+            margin-top: 2px;
+            display: none;
+        }
+        .tree-children.expanded { display: block; }
+        .tree-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 8px;
+            margin: 2px 0;
+            background: rgba(255,255,255,0.03);
+            border: 1px solid rgba(255,255,255,0.05);
+            border-radius: 4px;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 10px;
+        }
+        body.compact .tree-item { padding: 3px 6px; font-size: 9px; }
+        .tree-item:hover {
+            background: rgba(255,255,255,0.06);
+            border-color: rgba(255,255,255,0.15);
+        }
+        .tree-item.selected {
+            background: rgba(102, 126, 234, 0.1);
+            border-color: rgba(102, 126, 234, 0.3);
+        }
+        .tree-item.recent {
+            border-color: rgba(0, 184, 148, 0.4);
+            background: rgba(0, 184, 148, 0.05);
+        }
+        .tree-item-icon {
+            font-size: 12px;
+        }
+        body.compact .tree-item-icon { font-size: 11px; }
+        .tree-item-text {
+            flex: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            color: rgba(255,255,255,0.7);
+        }
+        .tree-item-type {
+            font-size: 8px;
+            padding: 2px 4px;
+            border-radius: 3px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .tree-item-type.action {
+            background: rgba(102, 126, 234, 0.3);
+            color: #a5b4fc;
+        }
+        .tree-item-type.trigger {
+            background: rgba(139, 92, 246, 0.3);
+            color: #c4b5fd;
+        }
+
+        .tree-empty {
+            text-align: center;
+            padding: 40px 20px;
+            color: rgba(255,255,255,0.4);
+        }
+        .tree-empty-icon {
+            font-size: 48px;
+            margin-bottom: 12px;
+            opacity: 0.6;
+        }
+        .tree-empty-text {
+            font-size: 11px;
+            line-height: 1.6;
+        }
 
         .flow-timeline { position: relative; }
         .flow-item {
@@ -209,24 +420,28 @@
         .flow-item:hover { transform: translateX(4px); }
 
         .flow-time-col {
-            width: 80px; padding: 16px 0; text-align: right; padding-right: 20px;
+            width: 60px; padding: 10px 0; text-align: right; padding-right: 12px;
         }
+        body.compact .flow-time-col { width: 50px; padding: 8px 0; padding-right: 10px; }
         .flow-time {
-            font-size: 10px; color: rgba(255,255,255,0.4);
+            font-size: 9px; color: rgba(255,255,255,0.4);
             font-family: 'JetBrains Mono', monospace;
             font-weight: 500;
         }
+        body.compact .flow-time { font-size: 8px; }
 
         .flow-line-col {
-            width: 40px; display: flex; flex-direction: column;
+            width: 30px; display: flex; flex-direction: column;
             align-items: center; position: relative;
         }
+        body.compact .flow-line-col { width: 24px; }
         .flow-dot {
-            width: 14px; height: 14px; border-radius: 50%;
-            border: 3px solid rgba(0,0,0,0.6);
-            z-index: 1; margin-top: 18px;
-            box-shadow: 0 0 10px currentColor;
+            width: 10px; height: 10px; border-radius: 50%;
+            border: 2px solid rgba(0,0,0,0.6);
+            z-index: 1; margin-top: 12px;
+            box-shadow: 0 0 8px currentColor;
         }
+        body.compact .flow-dot { width: 8px; height: 8px; margin-top: 10px; }
         .flow-item.recent .flow-dot {
             animation: dotPulse 2s infinite;
         }
@@ -239,15 +454,17 @@
         }
         .flow-item:last-child .flow-connector { display: none; }
 
-        .flow-content-col { flex: 1; padding: 12px 0 12px 16px; }
+        .flow-content-col { flex: 1; padding: 8px 0 8px 12px; }
+        body.compact .flow-content-col { padding: 6px 0 6px 8px; }
         .flow-card {
             background: rgba(255,255,255,0.05);
             border: 1px solid rgba(255,255,255,0.1);
-            border-radius: 12px; padding: 16px 18px;
+            border-radius: 8px; padding: 10px 12px;
             backdrop-filter: blur(10px);
             transition: all 0.2s;
             cursor: pointer;
         }
+        body.compact .flow-card { padding: 8px 10px; border-radius: 6px; }
         .flow-card:hover {
             background: rgba(255,255,255,0.08);
             border-color: rgba(255,255,255,0.2);
@@ -260,14 +477,15 @@
 
         .flow-type-badge {
             display: inline-block;
-            padding: 4px 10px;
-            border-radius: 6px;
-            font-size: 10px;
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 8px;
             font-weight: 700;
             text-transform: uppercase;
             letter-spacing: 0.5px;
-            margin-bottom: 10px;
+            margin-bottom: 6px;
         }
+        body.compact .flow-type-badge { padding: 2px 6px; font-size: 7px; margin-bottom: 4px; }
         .flow-type-badge.action {
             background: linear-gradient(135deg, #667eea, #764ba2);
             color: #fff;
@@ -277,35 +495,43 @@
             color: #fff;
         }
 
-        .flow-header-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
-        .flow-actor-dot { width: 10px; height: 10px; border-radius: 50%; }
-        .flow-actor-name { font-weight: 600; font-size: 12px; color: rgba(255,255,255,0.7); }
-        .flow-icon { font-size: 18px; }
-        .flow-name { font-size: 15px; color: #ffeaa7; font-weight: 600; flex: 1; }
+        .flow-header-row { display: flex; align-items: center; gap: 6px; margin-bottom: 5px; }
+        body.compact .flow-header-row { gap: 4px; margin-bottom: 3px; }
+        .flow-actor-dot { width: 8px; height: 8px; border-radius: 50%; }
+        body.compact .flow-actor-dot { width: 6px; height: 6px; }
+        .flow-actor-name { font-weight: 600; font-size: 10px; color: rgba(255,255,255,0.7); }
+        body.compact .flow-actor-name { font-size: 9px; }
+        .flow-icon { font-size: 14px; }
+        body.compact .flow-icon { font-size: 12px; }
+        .flow-name { font-size: 12px; color: #ffeaa7; font-weight: 600; flex: 1; }
+        body.compact .flow-name { font-size: 11px; }
         .flow-count {
             background: rgba(255,255,255,0.1);
-            padding: 3px 10px;
-            border-radius: 10px;
-            font-size: 10px;
+            padding: 2px 8px;
+            border-radius: 8px;
+            font-size: 9px;
             color: rgba(255,255,255,0.6);
             font-weight: 600;
         }
+        body.compact .flow-count { padding: 1px 6px; font-size: 8px; }
 
         .flow-receivers {
-            margin-top: 10px;
-            padding-top: 10px;
+            margin-top: 6px;
+            padding-top: 6px;
             border-top: 1px solid rgba(255,255,255,0.1);
-            font-size: 11px;
+            font-size: 10px;
             color: rgba(255,255,255,0.5);
         }
+        body.compact .flow-receivers { margin-top: 4px; padding-top: 4px; font-size: 9px; }
 
         .flow-params {
-            font-family: 'JetBrains Mono', monospace; font-size: 11px;
+            font-family: 'JetBrains Mono', monospace; font-size: 10px;
             color: rgba(255,255,255,0.6); background: rgba(0,0,0,0.4);
-            padding: 10px 12px; border-radius: 8px; margin-top: 10px;
-            white-space: pre-wrap; max-height: 100px; overflow-y: auto;
+            padding: 8px 10px; border-radius: 6px; margin-top: 6px;
+            white-space: pre-wrap; max-height: 80px; overflow-y: auto;
             border: 1px solid rgba(255,255,255,0.05);
         }
+        body.compact .flow-params { padding: 6px 8px; font-size: 9px; max-height: 60px; margin-top: 4px; }
 
         .empty {
             display: flex;
@@ -315,63 +541,72 @@
             height: 100%;
             color: rgba(255,255,255,0.4);
             text-align: center;
+            padding: 20px;
         }
-        .empty-icon { font-size: 80px; margin-bottom: 24px; opacity: 0.6; }
-        .empty-title { font-size: 20px; color: rgba(255,255,255,0.7); margin-bottom: 12px; font-weight: 600; }
-        .empty-subtitle { font-size: 14px; max-width: 400px; line-height: 1.6; }
+        .empty-icon { font-size: 60px; margin-bottom: 16px; opacity: 0.6; }
+        body.compact .empty-icon { font-size: 48px; margin-bottom: 12px; }
+        .empty-title { font-size: 16px; color: rgba(255,255,255,0.7); margin-bottom: 8px; font-weight: 600; }
+        body.compact .empty-title { font-size: 14px; margin-bottom: 6px; }
+        .empty-subtitle { font-size: 12px; max-width: 350px; line-height: 1.6; }
+        body.compact .empty-subtitle { font-size: 11px; max-width: 300px; }
 
         /* Stats Panel */
         .stats-panel {
-            width: 320px;
-            background: rgba(0,0,0,0.3);
-            backdrop-filter: blur(10px);
-            border-left: 1px solid rgba(255,255,255,0.1);
             display: flex;
             flex-direction: column;
+            overflow: hidden;
         }
         .stats-header {
-            padding: 16px 20px;
+            padding: 10px 12px;
             background: rgba(0,0,0,0.3);
             border-bottom: 1px solid rgba(255,255,255,0.1);
-            font-weight: 600; font-size: 12px;
+            font-weight: 600; font-size: 11px;
             color: rgba(255,255,255,0.6);
-            text-transform: uppercase; letter-spacing: 1.5px;
+            text-transform: uppercase; letter-spacing: 1px;
         }
-        .stats-body { flex: 1; overflow-y: auto; padding: 16px; }
+        body.compact .stats-header { padding: 8px 10px; font-size: 10px; }
+        .stats-body { flex: 1; overflow-y: auto; padding: 12px; }
+        body.compact .stats-body { padding: 10px; }
         .stats-body::-webkit-scrollbar { width: 6px; }
         .stats-body::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 3px; }
 
         .stat-card {
             background: rgba(255,255,255,0.05);
             border: 1px solid rgba(255,255,255,0.1);
-            border-radius: 10px;
-            padding: 14px 16px;
-            margin-bottom: 12px;
+            border-radius: 8px;
+            padding: 10px 12px;
+            margin-bottom: 8px;
         }
+        body.compact .stat-card { padding: 8px 10px; margin-bottom: 6px; border-radius: 6px; }
         .stat-label {
-            font-size: 11px;
+            font-size: 9px;
             color: rgba(255,255,255,0.5);
             text-transform: uppercase;
             letter-spacing: 0.5px;
-            margin-bottom: 8px;
+            margin-bottom: 6px;
         }
+        body.compact .stat-label { font-size: 8px; margin-bottom: 4px; }
         .stat-value {
-            font-size: 24px;
+            font-size: 20px;
             font-weight: 700;
             color: #fff;
         }
-        .stat-value.large { font-size: 32px; }
+        body.compact .stat-value { font-size: 18px; }
+        .stat-value.large { font-size: 26px; }
+        body.compact .stat-value.large { font-size: 22px; }
 
         .stat-list {
-            margin-top: 8px;
+            margin-top: 6px;
         }
+        body.compact .stat-list { margin-top: 4px; }
         .stat-list-item {
             display: flex;
             justify-content: space-between;
-            padding: 8px 0;
+            padding: 6px 0;
             border-bottom: 1px solid rgba(255,255,255,0.05);
-            font-size: 12px;
+            font-size: 10px;
         }
+        body.compact .stat-list-item { padding: 4px 0; font-size: 9px; }
         .stat-list-item:last-child { border-bottom: none; }
         .stat-list-label { color: rgba(255,255,255,0.7); }
         .stat-list-value { font-weight: 600; color: #fff; }
@@ -458,24 +693,58 @@
             <button id="flowBtn" class="view-tab active">📊 Execution Flow</button>
             <button id="helpBtn" class="view-tab">📖 How to Use</button>
         </div>
-        <input id="searchBox" class="search-box" placeholder="Search actions, triggers, actors...">
+        <input id="searchBox" class="search-box" placeholder="Search actors, actions, triggers...">
         <div style="flex:1"></div>
+        <button id="compactBtn" class="header-btn">🔲 Compact</button>
         <button id="pauseBtn" class="header-btn">⏸️ Pause</button>
         <button id="clearBtn" class="header-btn danger">🗑️ Clear</button>
     </div>
 
     <div class="main">
-        <div id="flowView" class="flow-container"></div>
-        <div id="helpView" class="help-container" style="display:none;"></div>
-        <div class="stats-panel">
-            <div class="stats-header">Statistics</div>
-            <div class="stats-body" id="statsBody"></div>
+        <div id="flowView" style="display:flex; flex:1;">
+            <div class="tree-panel">
+                <div class="tree-header">
+                    <span class="tree-title">📁 Actors</span>
+                    <button id="expandAllBtn" class="tree-btn">Expand All</button>
+                    <button id="collapseAllBtn" class="tree-btn">Collapse</button>
+                </div>
+                <div class="tree-container" id="treeContainer"></div>
+            </div>
+            <div class="resizer" id="resizer"></div>
+            <div class="details-panel">
+                <div class="flow-container" id="detailsContainer"></div>
+                <div class="stats-panel">
+                    <div class="stats-header">Statistics</div>
+                    <div class="stats-body" id="statsBody"></div>
+                </div>
+            </div>
         </div>
+        <div id="helpView" class="help-container" style="display:none;"></div>
     </div>
 </body>
 </html>\`);
 
             tracerWindow.document.close();
+            
+            // Store functions in a safe namespace instead of global
+            tracerWindow.__analyzerHandlers = {
+                toggleActor: (actor) => {
+                    if (expandedActors.has(actor)) {
+                        expandedActors.delete(actor);
+                    } else {
+                        expandedActors.add(actor);
+                    }
+                    selectedActor = actor;
+                    selectedItem = null;
+                    renderContent();
+                },
+                selectItem: (index) => {
+                    selectedItem = executionFlow[index];
+                    selectedActor = selectedItem ? selectedItem.actor : null;
+                    renderContent();
+                }
+            };
+
             setTimeout(() => { setupWindowEvents(); renderContent(); }, 100);
         }
 
@@ -497,16 +766,39 @@
                 actorData.clear();
                 triggerData.clear();
                 selectedItem = null;
+                selectedActor = null;
                 renderContent();
             };
 
+            doc.getElementById('compactBtn').onclick = () => {
+                isCompactMode = !isCompactMode;
+                if (isCompactMode) {
+                    doc.body.classList.add('compact');
+                    doc.getElementById('compactBtn').textContent = '🔳 Normal';
+                } else {
+                    doc.body.classList.remove('compact');
+                    doc.getElementById('compactBtn').textContent = '🔲 Compact';
+                }
+            };
+
             doc.getElementById('searchBox').oninput = () => renderContent();
+
+            doc.getElementById('expandAllBtn').onclick = () => {
+                const actors = getUniqueActors();
+                actors.forEach(actor => expandedActors.add(actor));
+                renderContent();
+            };
+
+            doc.getElementById('collapseAllBtn').onclick = () => {
+                expandedActors.clear();
+                renderContent();
+            };
 
             doc.getElementById('flowBtn').onclick = () => {
                 currentView = 'flow';
                 doc.getElementById('flowBtn').classList.add('active');
                 doc.getElementById('helpBtn').classList.remove('active');
-                doc.getElementById('flowView').style.display = 'block';
+                doc.getElementById('flowView').style.display = 'flex';
                 doc.getElementById('helpView').style.display = 'none';
                 renderContent();
             };
@@ -519,6 +811,61 @@
                 doc.getElementById('helpView').style.display = 'block';
                 renderHelp();
             };
+
+            // Resizer functionality
+            const resizer = doc.getElementById('resizer');
+            const treePanel = doc.querySelector('.tree-panel');
+            let isResizing = false;
+            let startX = 0;
+            let startWidth = 0;
+
+            resizer.onmousedown = (e) => {
+                isResizing = true;
+                startX = e.clientX;
+                startWidth = treePanel.offsetWidth;
+                doc.body.style.cursor = 'col-resize';
+                doc.body.style.userSelect = 'none';
+                e.preventDefault();
+            };
+
+            doc.onmousemove = (e) => {
+                if (!isResizing) return;
+                const diff = e.clientX - startX;
+                const newWidth = startWidth + diff;
+                if (newWidth > MIN_PANEL_WIDTH && newWidth < MAX_PANEL_WIDTH) {
+                    treePanel.style.width = newWidth + 'px';
+                }
+            };
+
+            doc.onmouseup = () => {
+                if (isResizing) {
+                    isResizing = false;
+                    doc.body.style.cursor = '';
+                    doc.body.style.userSelect = '';
+                }
+            };
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function formatActionName(action) {
+            return String(action).replace(/^action-/, '').split('-')
+                .map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+        }
+
+        function formatTriggerName(trigger) {
+            return String(trigger || 'Unknown').replace(/^on-/i, '').replace(/-/g, ' ')
+                .split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+        }
+
+        function getUniqueActors() {
+            const actors = new Set();
+            executionFlow.forEach(f => actors.add(f.actor));
+            return Array.from(actors).sort();
         }
 
         function renderContent() {
@@ -526,32 +873,155 @@
             if (currentView === 'help') {
                 renderHelp();
             } else {
-                renderFlow();
+                renderTree();
+                renderDetails();
                 renderStats();
             }
         }
 
-        function renderFlow() {
+        function renderTree() {
             if (!tracerWindow || tracerWindow.closed) return;
             const doc = tracerWindow.document;
-            const container = doc.getElementById('flowView');
+            const container = doc.getElementById('treeContainer');
             const search = doc.getElementById('searchBox').value.toLowerCase();
 
-            const filtered = executionFlow.filter(f => {
-                if (!search) return true;
-                return f.actor.toLowerCase().includes(search) ||
-                       f.name.toLowerCase().includes(search) ||
-                       (f.type === 'trigger' && f.trigger?.toLowerCase().includes(search));
+            if (executionFlow.length === 0) {
+                container.innerHTML = \`
+                    <div class="tree-empty">
+                        <div class="tree-empty-icon">⚡</div>
+                        <div class="tree-empty-text">No actors yet.<br>Start interacting with the game.</div>
+                    </div>
+                \`;
+                return;
+            }
+
+            const now = Date.now();
+            const actors = getUniqueActors();
+
+            // Group items by actor
+            const actorItems = {};
+            executionFlow.forEach(item => {
+                if (!actorItems[item.actor]) actorItems[item.actor] = [];
+                actorItems[item.actor].push(item);
             });
 
-            if (filtered.length === 0) {
+            let html = '';
+            actors.forEach(actor => {
+                const items = actorItems[actor] || [];
+                const filteredItems = items.filter(item => {
+                    if (!search) return true;
+                    return actor.toLowerCase().includes(search) ||
+                           item.name?.toLowerCase().includes(search) ||
+                           item.trigger?.toLowerCase().includes(search);
+                });
+
+                if (search && filteredItems.length === 0) return;
+
+                const color = getActorColor(actor);
+                const isExpanded = expandedActors.has(actor);
+                const isSelected = selectedActor === actor;
+                const count = items.length;
+                const actorDisplay = escapeHtml(actor.replace(/^actor-/, ''));
+
+                html += \`
+                    <div class="tree-actor-group">
+                        <div class="tree-actor-header \${isSelected ? 'selected' : ''}" data-actor="\${escapeHtml(actor)}">
+                            <span class="tree-expand-icon \${isExpanded ? 'expanded' : ''}">▶</span>
+                            <div class="tree-actor-dot" style="background:\${color}"></div>
+                            <div class="tree-actor-name">\${actorDisplay}</div>
+                            <span class="tree-badge">\${count}</span>
+                        </div>
+                        <div class="tree-children \${isExpanded ? 'expanded' : ''}">
+                \`;
+
+                if (isExpanded) {
+                    filteredItems.slice(0, MAX_TREE_ITEMS).forEach(item => {
+                        const isRecent = now - item.time < 3000;
+                        const isItemSelected = selectedItem === item;
+                        const itemIndex = executionFlow.indexOf(item);
+                        
+                        if (item.type === 'action') {
+                            const actionName = escapeHtml(formatActionName(item.name));
+                            html += \`
+                                <div class="tree-item \${isRecent ? 'recent' : ''} \${isItemSelected ? 'selected' : ''}" 
+                                     data-item-index="\${itemIndex}">
+                                    <span class="tree-item-icon">🎬</span>
+                                    <span class="tree-item-text">\${actionName}</span>
+                                    <span class="tree-item-type action">A</span>
+                                </div>
+                            \`;
+                        } else if (item.type === 'trigger') {
+                            const triggerName = escapeHtml(formatTriggerName(item.trigger));
+                            const icon = getTriggerIcon(item.trigger);
+                            html += \`
+                                <div class="tree-item \${isRecent ? 'recent' : ''} \${isItemSelected ? 'selected' : ''}" 
+                                     data-item-index="\${itemIndex}">
+                                    <span class="tree-item-icon">\${icon}</span>
+                                    <span class="tree-item-text">\${triggerName}</span>
+                                    <span class="tree-item-type trigger">T</span>
+                                </div>
+                            \`;
+                        }
+                    });
+                }
+
+                html += \`
+                        </div>
+                    </div>
+                \`;
+            });
+
+            container.innerHTML = html;
+
+            // Add event delegation for tree interactions
+            container.onclick = (e) => {
+                const actorHeader = e.target.closest('.tree-actor-header');
+                if (actorHeader) {
+                    const actor = actorHeader.getAttribute('data-actor');
+                    if (actor && tracerWindow.__analyzerHandlers) {
+                        tracerWindow.__analyzerHandlers.toggleActor(actor);
+                    }
+                    return;
+                }
+
+                const treeItem = e.target.closest('.tree-item');
+                if (treeItem) {
+                    const itemIndex = parseInt(treeItem.getAttribute('data-item-index'), 10);
+                    if (!isNaN(itemIndex) && tracerWindow.__analyzerHandlers) {
+                        tracerWindow.__analyzerHandlers.selectItem(itemIndex);
+                    }
+                }
+            };
+        }
+
+        function renderDetails() {
+            if (!tracerWindow || tracerWindow.closed) return;
+            const doc = tracerWindow.document;
+            const container = doc.getElementById('detailsContainer');
+            const search = doc.getElementById('searchBox').value.toLowerCase();
+
+            let itemsToShow = executionFlow;
+
+            // Filter by selected actor or search
+            if (selectedActor) {
+                itemsToShow = executionFlow.filter(f => f.actor === selectedActor);
+            } else if (search) {
+                itemsToShow = executionFlow.filter(f => {
+                    return f.actor.toLowerCase().includes(search) ||
+                           f.name?.toLowerCase().includes(search) ||
+                           (f.type === 'trigger' && f.trigger?.toLowerCase().includes(search));
+                });
+            }
+
+            if (itemsToShow.length === 0) {
                 container.innerHTML = \`
                     <div class="empty">
                         <div class="empty-icon">⚡</div>
-                        <div class="empty-title">Waiting for code execution...</div>
+                        <div class="empty-title">No items to show</div>
                         <div class="empty-subtitle">
-                            The analyzer will capture all actor actions and trigger exposures in real-time.
-                            Start interacting with the game to see the execution flow.
+                            \${selectedActor ? 'No events for this actor yet.' : 
+                              search ? 'No matches found. Try a different search.' :
+                              'Start interacting with the game to see the execution flow.'}
                         </div>
                     </div>
                 \`;
@@ -561,13 +1031,14 @@
             const now = Date.now();
             let html = '<div class="flow-timeline">';
 
-            filtered.slice(0, MAX_FLOW_DISPLAY).forEach((item, idx) => {
+            itemsToShow.slice(0, MAX_FLOW_DISPLAY).forEach((item, idx) => {
                 const isRecent = now - item.time < 3000;
                 const color = getActorColor(item.actor);
                 const params = formatParams(item.params || item.state);
 
                 if (item.type === 'action') {
-                    const actionName = String(item.name).replace(/^action-/, '').split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+                    const actionName = escapeHtml(formatActionName(item.name));
+                    const actorDisplay = escapeHtml(item.actor.replace(/^actor-/, ''));
                     html += \`
                         <div class="flow-item \${isRecent ? 'recent' : ''}">
                             <div class="flow-time-col"><div class="flow-time">\${getRelativeTime(item.time)}</div></div>
@@ -580,21 +1051,23 @@
                                     <span class="flow-type-badge action">ACTION</span>
                                     <div class="flow-header-row">
                                         <div class="flow-actor-dot" style="background:\${color}"></div>
-                                        <div class="flow-actor-name">\${item.actor.replace(/^actor-/, '')}</div>
+                                        <div class="flow-actor-name">\${actorDisplay}</div>
                                     </div>
                                     <div class="flow-header-row">
                                         <div class="flow-icon">🎬</div>
                                         <div class="flow-name">\${actionName}</div>
                                     </div>
-                                    \${params ? '<div class="flow-params">' + params + '</div>' : ''}
+                                    \${params ? '<div class="flow-params">' + escapeHtml(params) + '</div>' : ''}
                                 </div>
                             </div>
                         </div>
                     \`;
                 } else if (item.type === 'trigger') {
-                    const triggerName = String(item.trigger || 'Unknown').replace(/^on-/i, '').replace(/-/g, ' ').split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+                    const triggerName = escapeHtml(formatTriggerName(item.trigger));
+                    const actorDisplay = escapeHtml(item.actor);
                     const icon = getTriggerIcon(item.trigger);
                     const receivers = item.receivers || [];
+                    const receiversText = receivers.slice(0, 3).map(r => escapeHtml(r)).join(', ') + (receivers.length > 3 ? '...' : '');
                     html += \`
                         <div class="flow-item \${isRecent ? 'recent' : ''}">
                             <div class="flow-time-col"><div class="flow-time">\${getRelativeTime(item.time)}</div></div>
@@ -607,14 +1080,14 @@
                                     <span class="flow-type-badge trigger">TRIGGER</span>
                                     <div class="flow-header-row">
                                         <div class="flow-actor-dot" style="background:#8b5cf6"></div>
-                                        <div class="flow-actor-name">\${item.actor}</div>
+                                        <div class="flow-actor-name">\${actorDisplay}</div>
                                     </div>
                                     <div class="flow-header-row">
                                         <div class="flow-icon">\${icon}</div>
                                         <div class="flow-name">\${triggerName}</div>
                                     </div>
-                                    \${receivers.length > 0 ? '<div class="flow-receivers">→ ' + receivers.length + ' receivers: ' + receivers.slice(0, 3).join(', ') + (receivers.length > 3 ? '...' : '') + '</div>' : ''}
-                                    \${params ? '<div class="flow-params">' + params + '</div>' : ''}
+                                    \${receivers.length > 0 ? '<div class="flow-receivers">→ ' + receivers.length + ' receivers: ' + receiversText + '</div>' : ''}
+                                    \${params ? '<div class="flow-params">' + escapeHtml(params) + '</div>' : ''}
                                 </div>
                             </div>
                         </div>
@@ -670,7 +1143,7 @@
                     <div class="stat-list">
                         \${topActors.map(([actor, count]) => \`
                             <div class="stat-list-item">
-                                <div class="stat-list-label">\${actor.replace(/^actor-/, '')}</div>
+                                <div class="stat-list-label">\${escapeHtml(actor.replace(/^actor-/, ''))}</div>
                                 <div class="stat-list-value">\${count}</div>
                             </div>
                         \`).join('')}
