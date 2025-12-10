@@ -1,0 +1,1534 @@
+// ==UserScript==
+// @name         Zeus Visual Editor v3 (Alt+V)
+// @namespace    http://tampermonkey.net/
+// @version      0.1
+// @description  Press Alt+V to open the PIXI visual editor overlay
+// @author       ZeusPlay
+// @match        *://*/*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+// Visual Editor v3 - Fixed PIXI detection (Tampermonkey build with Alt+V)
+// Paste in browser via Tampermonkey; press Alt+V to open
+
+(function() {
+    if (window.__VE3_TM_LOADED__) {
+        console.log('[VE] Visual Editor v3 already loaded');
+        return;
+    }
+    window.__VE3_TM_LOADED__ = true;
+
+    console.log('🎨 [VE] Starting Visual Editor v3...');
+
+    // ========== Globals ==========
+    let pixiApp = null;
+    let PIXI = null;
+    let SpineClass = null;
+    let spineDataMap = new Map(); // Store available spine data
+
+    let editorWindow = null;
+    let selectedObject = null;
+    let referenceObject = null; // For center-to-ref
+    let expandedNodes = new Set(['stage']);
+    let filterOnlyVisible = false;
+    let filterOnlySpine = false;
+    let highlightOverlay = null;
+
+    // ========== PIXI Detection (run once) ==========
+    function detectPIXI() {
+        // Find app
+        if (window.__PIXI_APP__) pixiApp = window.__PIXI_APP__;
+        else if (window.ZeusPlay?.pixiApp) pixiApp = window.ZeusPlay.pixiApp;
+        else {
+            const canvas = document.querySelector('canvas');
+            if (canvas?.__PIXI_APP__) pixiApp = canvas.__PIXI_APP__;
+        }
+
+        if (!pixiApp) {
+            console.error('[VE] No PIXI app found!');
+            return false;
+        }
+        console.log('[VE] ✅ PIXI App found:', pixiApp);
+
+        // Find PIXI library - check multiple locations
+        PIXI = window.PIXI;
+        if (!PIXI) {
+            // Try to get from app's stage constructor
+            const stage = pixiApp.stage;
+            if (stage?.constructor) {
+                // Walk up the prototype to find Container
+                let proto = stage.constructor;
+                while (proto && proto.name !== 'Container') {
+                    proto = Object.getPrototypeOf(proto);
+                }
+                if (proto) {
+                    // Try to access PIXI through various means
+                    const keys = Object.keys(window);
+                    for (const key of keys) {
+                        const val = window[key];
+                        if (val && typeof val === 'object' && val.Container === stage.constructor) {
+                            PIXI = val;
+                            console.log('[VE] ✅ PIXI found at window.' + key);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // If still no PIXI, create minimal version from app
+        if (!PIXI) {
+            console.log('[VE] Creating minimal PIXI from app...');
+            PIXI = {
+                Container: pixiApp.stage.constructor,
+                Sprite: null,
+                Graphics: null,
+                Text: null
+            };
+
+            // Find classes from existing objects in stage
+            function findClasses(node) {
+                const name = node.constructor?.name || '';
+                if (name.includes('Sprite') && node.texture && !PIXI.Sprite) {
+                    PIXI.Sprite = node.constructor;
+                }
+                if (name.includes('Graphics') && !PIXI.Graphics) {
+                    PIXI.Graphics = node.constructor;
+                }
+                if (name.includes('Text') && node.text !== undefined && !PIXI.Text) {
+                    PIXI.Text = node.constructor;
+                    PIXI.TextStyle = node.style?.constructor;
+                }
+                if (node.children) node.children.forEach(findClasses);
+            }
+            findClasses(pixiApp.stage);
+            console.log('[VE] Found classes:', Object.keys(PIXI).filter(k => PIXI[k]));
+        }
+
+        // Find Spine class and collect spine data from existing spine objects
+        function findSpine(node, parentName = '') {
+            if (node.skeleton && node.state) {
+                if (!SpineClass) {
+                    SpineClass = node.constructor;
+                    console.log('[VE] ✅ Spine class found:', SpineClass.name);
+                }
+                // Store spine data for reuse - try multiple ways to get data and name
+                const data = node.skeleton?.data || node.spineData;
+                if (data) {
+                    // Try to get a meaningful name - prefer node/parent name over data.name/hash
+                    let spineName = null;
+
+                    // 1. Try node's own name (if meaningful)
+                    if (node.name && !isGenericName(node.name)) {
+                        spineName = node.name;
+                    }
+                    // 2. Try node's label
+                    else if (node.label && !isGenericName(node.label)) {
+                        spineName = node.label;
+                    }
+                    // 3. Try parent's name
+                    else if (parentName && !isGenericName(parentName)) {
+                        spineName = parentName;
+                    }
+                    // 4. Try data.name (might be null)
+                    else if (data.name && typeof data.name === 'string' && data.name.length > 0) {
+                        spineName = data.name;
+                    }
+                    // 5. Fallback to numbered spine
+                    else {
+                        spineName = 'spine_' + spineDataMap.size;
+                    }
+
+                    // Avoid duplicates - use data object reference check
+                    let alreadyStored = false;
+                    for (const [k, v] of spineDataMap) {
+                        if (v === data) { alreadyStored = true; break; }
+                    }
+                    if (!alreadyStored) {
+                        spineDataMap.set(spineName, data);
+                        console.log('[VE] 📦 Stored spine data:', spineName);
+                    }
+                }
+            }
+            if (node.children) {
+                const myName = node.name || node.label || parentName;
+                node.children.forEach(c => findSpine(c, myName));
+            }
+        }
+        findSpine(pixiApp.stage, '');
+
+        if (spineDataMap.size > 0) {
+            console.log('[VE] ✅ Found', spineDataMap.size, 'spine data:', [...spineDataMap.keys()]);
+        } else {
+            console.log('[VE] ⚠️ No spine data collected (spines may share same data object)');
+        }
+
+        if (!SpineClass) {
+            console.warn('[VE] Spine class not found in stage');
+        }
+
+        return true;
+    }
+
+    // ========== Helpers ==========
+    function isSpine(node) {
+        return !!(node.skeleton && node.state);
+    }
+
+    function getSpineData(node) {
+        return node.skeleton?.data || node.spineData;
+    }
+
+    function getAnimations(node) {
+        const data = getSpineData(node);
+        if (!data) return [];
+        return data.animations || [];
+    }
+
+    function getSkins(node) {
+        const data = getSpineData(node);
+        if (!data) return [];
+        return data.skins || [];
+    }
+
+    function getNodeName(node) {
+        if (node.name && !isGenericName(node.name)) return node.name;
+        if (node.label && !isGenericName(node.label)) return node.label;
+        if (node.parent?.name && !isGenericName(node.parent.name)) return node.parent.name;
+        return node.constructor?.name || 'Object';
+    }
+
+    function isGenericName(name) {
+        return !name || /^(Spine\d*|Container\d*|Sprite\d*|Graphics\d*|Mesh\d*|SpineSprite\d*|e|c)$/i.test(name);
+    }
+
+    function getNodeIcon(node) {
+        if (isSpine(node)) return '🦴';
+        if (node.texture && !node.children?.length) return '🖼';
+        if (node.text !== undefined) return '📝';
+        if (node.children?.length > 0) return '📁';
+        return '📄';
+    }
+
+    // ========== Highlight ==========
+    function createHighlight() {
+        if (highlightOverlay) return;
+        highlightOverlay = document.createElement('div');
+        highlightOverlay.id = '__ve_hl__';
+        Object.assign(highlightOverlay.style, {
+            position: 'fixed', border: '3px solid #00BFFF',
+            background: 'rgba(0,191,255,0.08)', pointerEvents: 'none',
+            zIndex: '2147483645', display: 'none', boxSizing: 'border-box'
+        });
+        const label = document.createElement('div');
+        Object.assign(label.style, {
+            position: 'absolute', bottom: '100%', left: '-3px',
+            background: '#00BFFF', color: '#000', padding: '2px 8px',
+            fontSize: '11px', fontFamily: 'system-ui', fontWeight: '600',
+            whiteSpace: 'nowrap', borderRadius: '4px 4px 0 0'
+        });
+        const info = document.createElement('div');
+        Object.assign(info.style, {
+            position: 'absolute', top: '100%', left: '-3px',
+            background: 'rgba(0,0,0,0.8)', color: '#00BFFF',
+            padding: '2px 6px', fontSize: '10px', fontFamily: 'monospace',
+            whiteSpace: 'nowrap', borderRadius: '0 0 4px 4px'
+        });
+        highlightOverlay.appendChild(label);
+        highlightOverlay.appendChild(info);
+        document.body.appendChild(highlightOverlay);
+    }
+
+    function updateHighlight() {
+        createHighlight();
+        const node = selectedObject?.pixiNode;
+        if (!node || !node.worldVisible) {
+            highlightOverlay.style.display = 'none';
+            return;
+        }
+        try {
+            const bounds = node.getBounds?.(true);
+            if (!bounds || !isFinite(bounds.x) || bounds.width === 0) {
+                highlightOverlay.style.display = 'none';
+                return;
+            }
+            const canvas = document.querySelector('canvas');
+            if (!canvas) return;
+            const rect = canvas.getBoundingClientRect();
+            const resolution = pixiApp.renderer?.resolution || 1;
+            const scaleX = rect.width / (canvas.width / resolution);
+            const scaleY = rect.height / (canvas.height / resolution);
+
+            Object.assign(highlightOverlay.style, {
+                left: (rect.left + bounds.x * scaleX) + 'px',
+                top: (rect.top + bounds.y * scaleY) + 'px',
+                width: (bounds.width * scaleX) + 'px',
+                height: (bounds.height * scaleY) + 'px',
+                display: 'block'
+            });
+            const displayName = typeof selectedObject.name === 'string' ? selectedObject.name : getNodeName(node);
+            highlightOverlay.children[0].textContent = displayName || 'Selected';
+            highlightOverlay.children[1].textContent = `x:${(node.x||0).toFixed(0)} y:${(node.y||0).toFixed(0)} s:${(node.scale?.x||1).toFixed(2)}`;
+        } catch (e) {
+            highlightOverlay.style.display = 'none';
+        }
+    }
+
+    // ========== Add Actor ==========
+    function addNewActor(type) {
+        console.log('[VE] Adding:', type);
+        console.log('[VE] PIXI classes available:', {
+            Container: !!PIXI?.Container,
+            Graphics: !!PIXI?.Graphics,
+            Text: !!PIXI?.Text,
+            TextStyle: !!PIXI?.TextStyle
+        });
+
+        const parent = selectedObject?.pixiNode || pixiApp.stage;
+        const cx = pixiApp.renderer.width / 2;
+        const cy = pixiApp.renderer.height / 2;
+
+        let newNode = null;
+
+        try {
+            if (type === 'container') {
+                const ContainerClass = PIXI?.Container || pixiApp.stage.constructor;
+                console.log('[VE] Using Container class:', ContainerClass?.name);
+                newNode = new ContainerClass();
+                newNode.name = 'new_container_' + Date.now();
+            }
+            else if (type === 'graphics') {
+                let GraphicsClass = PIXI?.Graphics;
+                if (!GraphicsClass) {
+                    const existing = findFirstOfType('Graphics');
+                    GraphicsClass = existing?.constructor;
+                }
+                console.log('[VE] Using Graphics class:', GraphicsClass?.name);
+                if (GraphicsClass) {
+                    newNode = new GraphicsClass();
+                    // PIXI v7 uses different API
+                    if (typeof newNode.beginFill === 'function') {
+                        newNode.beginFill(0xFF6B6B);
+                        newNode.drawRect(-50, -50, 100, 100);
+                        newNode.endFill();
+                    } else if (typeof newNode.rect === 'function') {
+                        // PIXI v8
+                        newNode.rect(-50, -50, 100, 100).fill(0xFF6B6B);
+                    }
+                    newNode.name = 'new_rect_' + Date.now();
+                }
+            }
+            else if (type === 'text') {
+                let TextClass = PIXI?.Text;
+                let StyleClass = PIXI?.TextStyle;
+                if (!TextClass) {
+                    const existing = findFirstOfType('Text');
+                    TextClass = existing?.constructor;
+                    StyleClass = existing?.style?.constructor;
+                }
+                console.log('[VE] Using Text class:', TextClass?.name, 'Style:', StyleClass?.name);
+                if (TextClass) {
+                    if (StyleClass) {
+                        const style = new StyleClass({ fill: '#ffffff', fontSize: 32, fontFamily: 'Arial' });
+                        newNode = new TextClass('Hello!', style);
+                    } else {
+                        newNode = new TextClass('Hello!', { fill: '#ffffff', fontSize: 32 });
+                    }
+                    newNode.name = 'new_text_' + Date.now();
+                }
+            }
+        } catch (e) {
+            console.error('[VE] Error creating ' + type + ':', e);
+        }
+
+        if (newNode) {
+            newNode.x = cx;
+            newNode.y = cy;
+            parent.addChild(newNode);
+            console.log('[VE] ✅ Added:', newNode.name, 'at', cx, cy);
+            setStatus('✅ Added ' + type);
+            // Build path and select the new node
+            const path = buildPath(newNode);
+            renderTree();
+            if (path) selectNode(newNode, path);
+            return newNode;
+        }
+
+        console.error('[VE] Could not create:', type);
+        setStatus('❌ Cannot create ' + type);
+        return null;
+    }
+
+    // ========== Add Spine from picker ==========
+    function showSpinePicker() {
+        if (spineDataMap.size === 0) {
+            setStatus('❌ No spine data found');
+            return;
+        }
+
+        const doc = editorWindow.document;
+        // Remove existing picker
+        const existing = doc.getElementById('spinePicker');
+        if (existing) existing.remove();
+
+        const picker = doc.createElement('div');
+        picker.id = 'spinePicker';
+        picker.className = 'spine-picker';
+        picker.style.left = '50px';
+        picker.style.top = '100px';
+
+        let html = '<div class="spine-picker-title">🦴 Select Spine</div>';
+        for (const [name, data] of spineDataMap) {
+            html += `<div class="spine-picker-item" data-spine="${name}">${name}</div>`;
+        }
+        html += '<div class="spine-picker-item" style="color:#666;margin-top:8px" data-spine="__cancel__">Cancel</div>';
+        picker.innerHTML = html;
+
+        picker.querySelectorAll('.spine-picker-item').forEach(item => {
+            item.onclick = () => {
+                const spineName = item.dataset.spine;
+                picker.remove();
+                if (spineName === '__cancel__') return;
+                addSpineActor(spineName);
+            };
+        });
+
+        doc.body.appendChild(picker);
+    }
+
+    function addSpineActor(spineName) {
+        const data = spineDataMap.get(spineName);
+        if (!data || !SpineClass) {
+            setStatus('❌ Cannot create spine');
+            return null;
+        }
+
+        const parent = selectedObject?.pixiNode || pixiApp.stage;
+        const cx = pixiApp.renderer.width / 2;
+        const cy = pixiApp.renderer.height / 2;
+
+        try {
+            const newNode = new SpineClass(data);
+            newNode.x = cx;
+            newNode.y = cy;
+            newNode.name = 'new_' + spineName + '_' + Date.now();
+            parent.addChild(newNode);
+            console.log('[VE] ✅ Added Spine:', newNode.name);
+            setStatus('✅ Added ' + spineName);
+            renderTree();
+            return newNode;
+        } catch (e) {
+            console.error('[VE] Spine create error:', e);
+            setStatus('❌ Spine error');
+            return null;
+        }
+    }
+
+    // ========== Center to Reference ==========
+    function setReference() {
+        if (!selectedObject?.pixiNode) return;
+        referenceObject = selectedObject.pixiNode;
+        updateRefUI();
+        setStatus('🎯 Ref set: ' + getNodeName(referenceObject));
+    }
+
+    function centerToRef(axis) {
+        if (!selectedObject?.pixiNode || !referenceObject) {
+            setStatus('❌ Select target and set reference first');
+            return;
+        }
+        const target = selectedObject.pixiNode;
+        const ref = referenceObject;
+
+        try {
+            const tBounds = target.getBounds();
+            const rBounds = ref.getBounds();
+            const tCenterX = tBounds.x + tBounds.width / 2;
+            const tCenterY = tBounds.y + tBounds.height / 2;
+            const rCenterX = rBounds.x + rBounds.width / 2;
+            const rCenterY = rBounds.y + rBounds.height / 2;
+
+            if (axis === 'x' || axis === 'xy') {
+                target.x += rCenterX - tCenterX;
+            }
+            if (axis === 'y' || axis === 'xy') {
+                target.y += rCenterY - tCenterY;
+            }
+
+            updatePropsUI();
+            updateRefUI(); // Update ref coords display
+            updateHighlight();
+            setStatus('⊕ Centered ' + axis.toUpperCase() + ' to ref');
+        } catch (e) {
+            console.error('[VE] Center to ref error:', e);
+        }
+    }
+
+    function updateRefUI() {
+        if (!editorWindow || editorWindow.closed) return;
+        const doc = editorWindow.document;
+        const section = doc.getElementById('refSection');
+        const nameEl = doc.getElementById('refName');
+        const coordsEl = doc.getElementById('refCoords');
+
+        if (section) section.style.display = 'block';
+        if (nameEl) nameEl.textContent = referenceObject ? getNodeName(referenceObject) : 'none';
+
+        // Show reference center coordinates
+        if (coordsEl && referenceObject) {
+            try {
+                const bounds = referenceObject.getBounds();
+                const cx = Math.round(bounds.x + bounds.width / 2);
+                const cy = Math.round(bounds.y + bounds.height / 2);
+                coordsEl.textContent = `Center: ${cx}, ${cy}`;
+            } catch (e) {
+                coordsEl.textContent = '-';
+            }
+        } else if (coordsEl) {
+            coordsEl.textContent = '-';
+        }
+    }
+
+    function findFirstOfType(typeName) {
+        let found = null;
+        function search(node) {
+            if (found) return;
+            if (node.constructor?.name?.includes(typeName)) {
+                found = node;
+                return;
+            }
+            if (node.children) node.children.forEach(search);
+        }
+        search(pixiApp.stage);
+        return found;
+    }
+
+    // Build path from stage to node
+    function buildPath(targetNode) {
+        function find(node, path) {
+            if (node === targetNode) return path;
+            if (node.children) {
+                for (let i = 0; i < node.children.length; i++) {
+                    const c = node.children[i];
+                    const result = find(c, path + '/' + (c.name || 'c' + i));
+                    if (result) return result;
+                }
+            }
+            return null;
+        }
+        return find(pixiApp.stage, 'stage');
+    }
+
+    // ========== Duplicate (Deep Clone) ==========
+    function duplicateNode(node, deep = true) {
+        console.log('[VE] Duplicating:', getNodeName(node), deep ? '(deep)' : '(shallow)');
+        if (!node.parent) {
+            console.error('[VE] No parent');
+            return null;
+        }
+
+        function cloneNode(src) {
+            let clone = null;
+
+            // Spine
+            if (isSpine(src) && SpineClass) {
+                const data = getSpineData(src);
+                if (data) {
+                    try {
+                        clone = new SpineClass(data);
+                        // Copy current animation
+                        const current = src.state?.getCurrent(0);
+                        if (current) clone.state?.setAnimation(0, current.animation.name, true);
+                        // Copy skin
+                        if (src.skeleton?.skin) {
+                            clone.skeleton?.setSkinByName(src.skeleton.skin.name);
+                            clone.skeleton?.setSlotsToSetupPose();
+                        }
+                        console.log('[VE] ✅ Spine cloned');
+                    } catch (e) {
+                        console.error('[VE] Spine clone error:', e);
+                    }
+                }
+            }
+
+            // Text - CHECK BEFORE SPRITE (text has texture too!)
+            if (!clone && src.text !== undefined) {
+                try {
+                    // Clone text style properly - extract style properties
+                    let styleObj = {};
+                    if (src.style) {
+                        const s = src.style;
+                        styleObj = {
+                            fill: s._fill || s.fill || '#ffffff',
+                            fontSize: s._fontSize || s.fontSize || 32,
+                            fontFamily: s._fontFamily || s.fontFamily || 'Arial',
+                            fontWeight: s._fontWeight || s.fontWeight,
+                            align: s._align || s.align,
+                            stroke: s._stroke || s.stroke,
+                            strokeThickness: s._strokeThickness || s.strokeThickness,
+                            dropShadow: s._dropShadow || s.dropShadow
+                        };
+                    }
+                    clone = new src.constructor(src.text, styleObj);
+                    if (src.anchor) clone.anchor?.set(src.anchor.x, src.anchor.y);
+                    console.log('[VE] ✅ Text cloned:', src.text);
+                } catch (e) {
+                    console.error('[VE] Text clone error:', e);
+                }
+            }
+
+            // Sprite (with texture)
+            if (!clone && src.texture) {
+                try {
+                    clone = new src.constructor(src.texture);
+                    if (src.anchor) clone.anchor?.set(src.anchor.x, src.anchor.y);
+                    clone.tint = src.tint;
+                    console.log('[VE] ✅ Sprite cloned');
+                } catch (e) {
+                    console.error('[VE] Sprite clone error:', e);
+                }
+            }
+
+            // Graphics
+            if (!clone && src.constructor?.name?.includes('Graphics')) {
+                try {
+                    clone = new src.constructor();
+                    if (src.geometry) clone.geometry = src.geometry;
+                    clone.tint = src.tint;
+                    console.log('[VE] ✅ Graphics cloned');
+                } catch (e) {
+                    console.error('[VE] Graphics clone error:', e);
+                }
+            }
+
+            // Container (fallback)
+            if (!clone) {
+                try {
+                    clone = new src.constructor();
+                    console.log('[VE] ✅ Container cloned');
+                } catch (e) {
+                    console.error('[VE] Container clone error:', e);
+                    return null;
+                }
+            }
+
+            // Copy common properties
+            if (clone) {
+                clone.x = src.x;
+                clone.y = src.y;
+                clone.scale?.set(src.scale?.x || 1, src.scale?.y || 1);
+                clone.alpha = src.alpha;
+                clone.rotation = src.rotation;
+                clone.visible = src.visible;
+                clone.name = (src.name || 'node') + '_dup';
+
+                // Deep clone children
+                if (deep && src.children && src.children.length > 0) {
+                    console.log('[VE] Cloning', src.children.length, 'children...');
+                    for (const child of src.children) {
+                        const childClone = cloneNode(child);
+                        if (childClone) clone.addChild(childClone);
+                    }
+                }
+            }
+
+            return clone;
+        }
+
+        const newNode = cloneNode(node);
+        if (newNode) {
+            newNode.x = node.x + 50;
+            newNode.y = node.y + 50;
+            node.parent.addChild(newNode);
+            setStatus('✅ Duplicated' + (deep ? ' (deep)' : ''));
+            renderTree();
+            return newNode;
+        }
+
+        setStatus('❌ Cannot duplicate');
+        return null;
+    }
+
+    // ========== Reparent (Move to another parent) ==========
+    function reparentNode(node, newParent) {
+        if (!node || !newParent || node === newParent) return false;
+        if (!node.parent) return false;
+
+        // Prevent moving parent into child
+        let check = newParent;
+        while (check) {
+            if (check === node) {
+                console.error('[VE] Cannot move parent into its own child');
+                setStatus('❌ Invalid reparent');
+                return false;
+            }
+            check = check.parent;
+        }
+
+        console.log('[VE] Reparenting:', getNodeName(node), '->', getNodeName(newParent));
+
+        // Calculate world position before reparent
+        const worldPos = node.getGlobalPosition?.() || { x: node.x, y: node.y };
+
+        node.parent.removeChild(node);
+        newParent.addChild(node);
+
+        // Adjust local position to maintain world position
+        const newWorldPos = node.getGlobalPosition?.() || { x: node.x, y: node.y };
+        node.x += worldPos.x - newWorldPos.x;
+        node.y += worldPos.y - newWorldPos.y;
+
+        setStatus('✅ Moved to ' + getNodeName(newParent));
+        renderTree();
+        return true;
+    }
+
+    // ========== UI ==========
+    function createEditorWindow() {
+        if (editorWindow && !editorWindow.closed) { editorWindow.focus(); return; }
+
+        editorWindow = window.open('', 'VE3', 'width=800,height=700,left=20,top=20');
+        const doc = editorWindow.document;
+
+        doc.write(`<!DOCTYPE html><html><head><title>Visual Editor v3</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font:12px system-ui;background:#1a1a2e;color:#ccc;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+.header{padding:8px 12px;background:#12121f;border-bottom:1px solid #333;display:flex;gap:8px;align-items:center}
+.title{font-weight:600;font-size:14px;color:#00BFFF}
+.toolbar{display:flex;padding:6px 10px;gap:5px;background:#151525;border-bottom:1px solid #333;flex-wrap:wrap}
+.tbtn{padding:5px 10px;background:#252540;border:1px solid #444;color:#aaa;cursor:pointer;font:inherit;border-radius:4px}
+.tbtn:hover{background:#333;color:#fff}
+.tbtn.active{background:#00BFFF;color:#000;border-color:#00BFFF}
+.tbtn.add{background:#4CAF50;color:#fff;border-color:#4CAF50}
+.tbtn.add:hover{background:#45a049}
+.main{display:flex;flex:1;overflow:hidden}
+.left-panel{width:380px;display:flex;flex-direction:column;border-right:1px solid #333}
+.search{padding:8px;background:#151525;border-bottom:1px solid #333}
+.search input{width:100%;background:#1a1a2e;border:1px solid #444;color:#fff;padding:7px 10px;border-radius:4px;font:inherit}
+.tree-wrap{flex:1;overflow:auto;padding:4px}
+.tree-wrap::-webkit-scrollbar{width:8px}
+.tree-wrap::-webkit-scrollbar-thumb{background:#444;border-radius:4px}
+.trow{display:flex;align-items:center;padding:4px 6px;cursor:grab;border-radius:4px;margin:1px 0;transition:background 0.1s}
+.trow:hover{background:rgba(255,255,255,0.06)}
+.trow.sel{background:rgba(0,191,255,0.2);border-left:3px solid #00BFFF}
+.trow.inv{opacity:0.35}
+.trow.drag-over{background:rgba(76,175,80,0.3);border:2px dashed #4CAF50}
+.trow.dragging{opacity:0.5;cursor:grabbing}
+.tarr{width:14px;font-size:9px;color:#555;flex-shrink:0;text-align:center}
+.ticon{font-size:11px;margin-right:5px}
+.tlbl{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:11px}
+.tact{display:none;gap:3px}
+.trow:hover .tact{display:flex}
+.tact button{padding:2px 6px;background:#333;border:none;color:#aaa;cursor:pointer;border-radius:3px;font-size:9px}
+.tact button:hover{background:#00BFFF;color:#000}
+.tchildren{margin-left:12px}
+.tchildren.hide{display:none}
+.right-panel{flex:1;background:#151525;overflow-y:auto;padding:12px;display:none}
+.right-panel.show{display:block}
+.props-title{font-size:10px;color:#666;margin-bottom:6px}
+.props-name{color:#00BFFF;font-weight:600;font-size:14px}
+.section{background:#1a1a2e;border:1px solid #333;border-radius:6px;padding:10px;margin-bottom:10px}
+.section-title{font-size:10px;color:#666;margin-bottom:8px;text-transform:uppercase;letter-spacing:0.5px}
+.props-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
+.prop{position:relative}
+.prop label{font-size:9px;color:#555;display:block;cursor:ew-resize;user-select:none;margin-bottom:2px}
+.prop label:hover{color:#00BFFF}
+.prop input{width:100%;background:#252540;border:1px solid #444;color:#fff;padding:6px;border-radius:4px;font:11px monospace}
+.prop input:focus{border-color:#00BFFF;outline:none}
+.delta-row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-top:1px solid #333;margin-top:8px}
+.delta-row label{font-size:10px;color:#666}
+.delta-row span{color:#FF6B6B;font:12px monospace;font-weight:600}
+.ref-section{background:#252535;border:1px solid #FF6B6B33;border-radius:6px;padding:10px;margin-bottom:10px}
+.ref-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.ref-title{font-size:10px;color:#FF6B6B}
+.ref-name{color:#FF6B6B;font-weight:600;font-size:12px}
+.ref-coords{color:#888;font:10px monospace}
+.ref-btns{display:grid;grid-template-columns:repeat(4,1fr);gap:4px}
+.ref-btns button{padding:6px;background:#252540;border:1px solid #444;color:#aaa;border-radius:4px;cursor:pointer;font:9px system-ui}
+.ref-btns button:hover{background:#FF6B6B;color:#000;border-color:#FF6B6B}
+.spine-picker{position:fixed;background:#1a1a2e;border:2px solid #00BFFF;border-radius:8px;padding:12px;z-index:999999;max-height:400px;overflow:auto;min-width:220px}
+.spine-picker-title{color:#00BFFF;font-weight:600;margin-bottom:10px;font-size:13px}
+.spine-picker-item{padding:8px 12px;cursor:pointer;border-radius:4px;margin:3px 0}
+.spine-picker-item:hover{background:#333}
+.center-btns{display:grid;grid-template-columns:repeat(3,1fr);gap:4px}
+.center-btns button{padding:7px;background:#252540;border:1px solid #444;color:#aaa;border-radius:4px;cursor:pointer;font:10px system-ui}
+.center-btns button:hover{background:#00BFFF;color:#000;border-color:#00BFFF}
+.action-btns{display:grid;grid-template-columns:repeat(4,1fr);gap:4px;margin-top:10px}
+.btn{padding:8px;background:#252540;border:1px solid #444;color:#aaa;border-radius:4px;cursor:pointer;font:inherit;text-align:center}
+.btn:hover{background:#333;color:#fff}
+.btn.pri{background:#00BFFF;color:#000;border-color:#00BFFF}
+.anim-list{max-height:100px;overflow:auto;background:#252540;border:1px solid #444;border-radius:4px}
+.anim-item{padding:6px 10px;cursor:pointer;border-bottom:1px solid #333;font-size:10px}
+.anim-item:hover{background:#333}
+.anim-item.active{background:#00BFFF;color:#000}
+.skin-select{width:100%;background:#252540;border:1px solid #444;color:#fff;padding:6px;border-radius:4px;margin-top:6px}
+.status{padding:5px 10px;background:#12121f;border-top:1px solid #333;font-size:10px;color:#555}
+</style></head>
+<body>
+<div class="header">
+    <span class="title">🎨 Visual Editor v3</span>
+</div>
+<div class="toolbar">
+    <button class="tbtn" id="bRef" title="Refresh">🔄</button>
+    <button class="tbtn" id="bExp" title="Expand All">⊞</button>
+    <button class="tbtn" id="bCol" title="Collapse">⊟</button>
+    <button class="tbtn" id="bVis" title="Only Visible">👁</button>
+    <button class="tbtn" id="bSpn" title="Only Spine">🦴</button>
+    <button class="tbtn add" id="bAddC">+ Container</button>
+    <button class="tbtn add" id="bAddS" style="background:#9C27B0;border-color:#9C27B0">+ Spine</button>
+</div>
+<div class="main">
+    <div class="left-panel">
+        <div class="search"><input type="text" id="srch" placeholder="🔍 Filter nodes..."></div>
+        <div class="tree-wrap" id="tree"></div>
+    </div>
+    <div class="right-panel" id="props">
+        <div class="props-title">Selected: <span class="props-name" id="pName">-</span></div>
+
+        <div class="section">
+            <div class="section-title">📍 Transform</div>
+            <div class="props-grid">
+                <div class="prop"><label data-scrub="pX">X</label><input type="number" id="pX" step="1"></div>
+                <div class="prop"><label data-scrub="pY">Y</label><input type="number" id="pY" step="1"></div>
+                <div class="prop"><label data-scrub="pR">Rotation°</label><input type="number" id="pR" step="5"></div>
+                <div class="prop"><label data-scrub="pSX">Scale X</label><input type="number" id="pSX" step="0.01"></div>
+                <div class="prop"><label data-scrub="pSY">Scale Y</label><input type="number" id="pSY" step="0.01"></div>
+                <div class="prop"><label data-scrub="pA">Alpha</label><input type="number" id="pA" step="0.1" min="0" max="1"></div>
+            </div>
+            <div class="delta-row">
+                <label>Δ from Center:</label>
+                <span id="pDelta">-</span>
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="section-title">⊕ Align to Screen Center</div>
+            <div class="center-btns">
+                <button id="bCtrX">Center X</button>
+                <button id="bCtrY">Center Y</button>
+                <button id="bCtrXY">Center XY</button>
+            </div>
+        </div>
+
+        <div id="refSection" class="ref-section" style="display:none">
+            <div class="ref-header">
+                <div>
+                    <div class="ref-title">🎯 Reference</div>
+                    <div class="ref-name" id="refName">none</div>
+                </div>
+                <div class="ref-coords" id="refCoords">-</div>
+            </div>
+            <div class="ref-btns">
+                <button id="bSetRef">Set Ref</button>
+                <button id="bCtrToRefX">X→Ref</button>
+                <button id="bCtrToRefY">Y→Ref</button>
+                <button id="bCtrToRefXY">XY→Ref</button>
+            </div>
+        </div>
+
+        <div id="animSection" class="section" style="display:none">
+            <div class="section-title">🎬 Animations</div>
+            <div class="anim-list" id="animList"></div>
+        </div>
+
+        <div id="skinSection" class="section" style="display:none">
+            <div class="section-title">🎭 Skin</div>
+            <select class="skin-select" id="skinSelect"></select>
+        </div>
+
+        <div id="textSection" class="section" style="display:none">
+            <div class="section-title">📝 Text Properties</div>
+            <div class="prop" style="margin-bottom:8px"><label>Content</label><input type="text" id="pText" placeholder="Text content..."></div>
+            <div class="props-grid">
+                <div class="prop"><label>Font Size</label><input type="number" id="pFontSize" step="1"></div>
+                <div class="prop"><label>Fill</label><input type="text" id="pFill" placeholder="#ffffff"></div>
+                <div class="prop"><label>Font</label><input type="text" id="pFontFamily" placeholder="Arial"></div>
+            </div>
+        </div>
+
+        <div class="action-btns">
+            <button class="btn" id="bVT">👁 Vis</button>
+            <button class="btn" id="bDup">📋 Dup</button>
+            <button class="btn" id="bDel">🗑 Del</button>
+            <button class="btn pri" id="bCode">💻 Code</button>
+        </div>
+    </div>
+</div>
+<div class="status" id="status">Ready</div>
+</body></html>`);
+        doc.close();
+        setTimeout(setupEvents, 100);
+    }
+
+    function setupEvents() {
+        if (!editorWindow || editorWindow.closed) return;
+        const doc = editorWindow.document;
+
+        doc.getElementById('bRef').onclick = renderTree;
+        doc.getElementById('bExp').onclick = () => { expandAll(); renderTree(); };
+        doc.getElementById('bCol').onclick = () => { expandedNodes = new Set(['stage']); renderTree(); };
+        doc.getElementById('bVis').onclick = (e) => {
+            filterOnlyVisible = !filterOnlyVisible;
+            e.target.classList.toggle('active', filterOnlyVisible);
+            renderTree();
+        };
+        doc.getElementById('bSpn').onclick = (e) => {
+            filterOnlySpine = !filterOnlySpine;
+            e.target.classList.toggle('active', filterOnlySpine);
+            renderTree();
+        };
+
+        doc.getElementById('bAddC').onclick = () => addNewActor('container');
+        doc.getElementById('bAddS').onclick = () => showSpinePicker();
+
+        doc.getElementById('srch').oninput = renderTree;
+
+        // Input change handlers
+        ['pX','pY','pSX','pSY','pA','pR'].forEach(id => {
+            const el = doc.getElementById(id);
+            if (!el) return;
+            el.oninput = (e) => {
+                if (!selectedObject?.pixiNode) return;
+                const node = selectedObject.pixiNode;
+                const val = parseFloat(e.target.value) || 0;
+                if (id === 'pX') node.x = val;
+                else if (id === 'pY') node.y = val;
+                else if (id === 'pSX') node.scale.x = val;
+                else if (id === 'pSY') node.scale.y = val;
+                else if (id === 'pA') node.alpha = Math.max(0, Math.min(1, val));
+                else if (id === 'pR') node.rotation = val * Math.PI / 180;
+                updateHighlight();
+            };
+        });
+
+        // Reference buttons
+        doc.getElementById('bSetRef').onclick = setReference;
+        doc.getElementById('bCtrToRefX').onclick = () => centerToRef('x');
+        doc.getElementById('bCtrToRefY').onclick = () => centerToRef('y');
+        doc.getElementById('bCtrToRefXY').onclick = () => centerToRef('xy');
+
+
+
+        // Scrub on label drag
+        doc.querySelectorAll('[data-scrub]').forEach(label => {
+            const inputId = label.dataset.scrub;
+            const input = doc.getElementById(inputId);
+            const isScale = inputId.startsWith('pS');
+            const step = isScale ? 0.01 : 1;
+            const multiplier = isScale ? 0.005 : 1;
+
+            let startX = 0, startVal = 0, dragging = false;
+
+            label.addEventListener('mousedown', (e) => {
+                e.preventDefault();
+                dragging = true;
+                startX = e.clientX;
+                startVal = parseFloat(input.value) || 0;
+                doc.body.style.cursor = 'ew-resize';
+                label.style.color = '#00BFFF';
+            });
+
+            doc.addEventListener('mousemove', (e) => {
+                if (!dragging || !selectedObject?.pixiNode) return;
+                const delta = (e.clientX - startX) * multiplier;
+                let newVal = startVal + delta;
+                if (isScale) newVal = Math.round(newVal * 100) / 100;
+                else newVal = Math.round(newVal);
+                input.value = newVal;
+                input.dispatchEvent(new Event('input'));
+            });
+
+            doc.addEventListener('mouseup', () => {
+                if (dragging) {
+                    dragging = false;
+                    doc.body.style.cursor = '';
+                    label.style.color = '';
+                }
+            });
+        });
+
+        // Center buttons
+        doc.getElementById('bCtrX').onclick = () => {
+            if (!selectedObject?.pixiNode) return;
+            const node = selectedObject.pixiNode;
+            const b = node.getBounds();
+            const cx = pixiApp.renderer.width / 2;
+            node.x += cx - (b.x + b.width / 2);
+            updatePropsUI();
+            updateHighlight();
+            setStatus('⊕ Centered X');
+        };
+
+        doc.getElementById('bCtrY').onclick = () => {
+            if (!selectedObject?.pixiNode) return;
+            const node = selectedObject.pixiNode;
+            const b = node.getBounds();
+            const cy = pixiApp.renderer.height / 2;
+            node.y += cy - (b.y + b.width / 2);
+            updatePropsUI();
+            updateHighlight();
+            setStatus('⊕ Centered Y');
+        };
+
+        doc.getElementById('bCtrXY').onclick = () => {
+            if (!selectedObject?.pixiNode) return;
+            const node = selectedObject.pixiNode;
+            const b = node.getBounds();
+            const cx = pixiApp.renderer.width / 2;
+            const cy = pixiApp.renderer.height / 2;
+            node.x += cx - (b.x + b.width / 2);
+            node.y += cy - (b.y + b.height / 2);
+            updatePropsUI();
+            updateHighlight();
+            setStatus('⊕ Centered XY');
+        };
+
+        doc.getElementById('bVT').onclick = () => {
+            if (!selectedObject?.pixiNode) return;
+            selectedObject.pixiNode.visible = !selectedObject.pixiNode.visible;
+            renderTree();
+        };
+
+        doc.getElementById('bDup').onclick = () => {
+            if (!selectedObject?.pixiNode) return;
+            duplicateNode(selectedObject.pixiNode);
+        };
+
+        doc.getElementById('bDel').onclick = () => {
+            if (!selectedObject?.pixiNode) return;
+            const node = selectedObject.pixiNode;
+            if (node.parent) {
+                node.parent.removeChild(node);
+                selectedObject = null;
+                doc.getElementById('props').classList.remove('show');
+                renderTree();
+                setStatus('🗑 Deleted');
+            }
+        };
+
+        doc.getElementById('bCode').onclick = copyCode;
+
+        doc.getElementById('skinSelect').onchange = (e) => {
+            if (!selectedObject?.pixiNode || !isSpine(selectedObject.pixiNode)) return;
+            const node = selectedObject.pixiNode;
+            const skinName = e.target.value;
+            try {
+                node.skeleton.setSkinByName(skinName);
+                node.skeleton.setSlotsToSetupPose();
+                setStatus('🎭 Skin: ' + skinName);
+            } catch (err) {
+                console.error('[VE] Skin error:', err);
+            }
+        };
+
+        // Text property handlers
+        doc.getElementById('pText').oninput = (e) => {
+            if (!selectedObject?.pixiNode || selectedObject.pixiNode.text === undefined) return;
+            selectedObject.pixiNode.text = e.target.value;
+        };
+        doc.getElementById('pFontSize').oninput = (e) => {
+            if (!selectedObject?.pixiNode?.style) return;
+            const node = selectedObject.pixiNode;
+            const val = parseFloat(e.target.value) || 32;
+            // PIXI v8 uses style object assignment
+            try {
+                node.style = { ...node.style, fontSize: val };
+            } catch(ex) {
+                node.style.fontSize = val;
+            }
+        };
+        doc.getElementById('pFill').oninput = (e) => {
+            if (!selectedObject?.pixiNode?.style) return;
+            const node = selectedObject.pixiNode;
+            const val = e.target.value;
+            try {
+                node.style = { ...node.style, fill: val };
+            } catch(ex) {
+                node.style.fill = val;
+            }
+        };
+        doc.getElementById('pFontFamily').oninput = (e) => {
+            if (!selectedObject?.pixiNode?.style) return;
+            const node = selectedObject.pixiNode;
+            const val = e.target.value;
+            try {
+                node.style = { ...node.style, fontFamily: val };
+            } catch(ex) {
+                node.style.fontFamily = val;
+            }
+        };
+
+        renderTree();
+    }
+
+    function expandAll() {
+        function addAll(node, path) {
+            expandedNodes.add(path);
+            if (node.children) {
+                node.children.forEach((c, i) => {
+                    addAll(c, path + '/' + (c.name || 'c' + i));
+                });
+            }
+        }
+        addAll(pixiApp.stage, 'stage');
+    }
+
+    function renderTree() {
+        if (!editorWindow || editorWindow.closed) return;
+        const doc = editorWindow.document;
+        const container = doc.getElementById('tree');
+        const search = doc.getElementById('srch').value.toLowerCase();
+
+        window.__veNodes = new Map();
+
+        function shouldShow(node) {
+            if (filterOnlyVisible && !(node.worldVisible ?? node.visible ?? true)) return false;
+            if (filterOnlySpine && !isSpine(node)) {
+                if (node.children) {
+                    for (const c of node.children) if (shouldShow(c)) return true;
+                }
+                return false;
+            }
+            return true;
+        }
+
+        function hasMatch(node, search) {
+            if (!search) return true;
+            if (getNodeName(node).toLowerCase().includes(search)) return true;
+            if (node.children) {
+                for (const c of node.children) if (hasMatch(c, search)) return true;
+            }
+            return false;
+        }
+
+        function render(node, path, depth) {
+            if (!shouldShow(node)) return '';
+            if (search && !hasMatch(node, search)) return '';
+
+            window.__veNodes.set(path, node);
+            const name = getNodeName(node);
+            const hasKids = node.children && node.children.length > 0;
+            const isExp = expandedNodes.has(path);
+            const isVis = node.worldVisible ?? node.visible ?? true;
+            const isSel = selectedObject?.path === path;
+            const icon = getNodeIcon(node);
+            const isSpn = isSpine(node);
+
+            let html = '<div class="tnode">';
+            html += `<div class="trow${isSel?' sel':''}${!isVis?' inv':''}" data-p="${path}" style="padding-left:${depth*10+4}px">`;
+            html += `<span class="tarr">${hasKids ? (isExp?'▼':'▶') : ''}</span>`;
+            html += `<span class="ticon">${icon}</span>`;
+            html += `<span class="tlbl">${name}</span>`;
+            html += '<span class="tact">';
+            if (isSpn) html += '<button data-a="anim">▶</button>';
+            html += '<button data-a="vis">👁</button>';
+            html += '<button data-a="dup">📋</button>';
+            html += '</span></div>';
+
+            if (hasKids) {
+                html += `<div class="tchildren${isExp?'':' hide'}">`;
+                const sorted = [...node.children].sort((a, b) => {
+                    const av = a.worldVisible ?? a.visible ?? true;
+                    const bv = b.worldVisible ?? b.visible ?? true;
+                    if (av && !bv) return -1;
+                    if (!av && bv) return 1;
+                    return 0;
+                });
+                sorted.forEach((c, i) => {
+                    html += render(c, path + '/' + (c.name || 'c' + i), depth + 1);
+                });
+                html += '</div>';
+            }
+            html += '</div>';
+            return html;
+        }
+
+        container.innerHTML = render(pixiApp.stage, 'stage', 0);
+
+        container.querySelectorAll('.trow').forEach(row => {
+            // Make draggable
+            row.draggable = true;
+
+            row.ondragstart = (e) => {
+                const path = row.dataset.p;
+                if (path === 'stage') { e.preventDefault(); return; } // Can't drag stage
+                e.dataTransfer.setData('text/plain', path);
+                e.dataTransfer.effectAllowed = 'move';
+                row.classList.add('dragging');
+                window.__veDragPath = path;
+            };
+
+            row.ondragend = () => {
+                row.classList.remove('dragging');
+                window.__veDragPath = null;
+                container.querySelectorAll('.drag-over').forEach(el => el.classList.remove('drag-over'));
+            };
+
+            row.ondragover = (e) => {
+                e.preventDefault();
+                const targetPath = row.dataset.p;
+                const srcPath = window.__veDragPath;
+                if (!srcPath || srcPath === targetPath) return;
+                // Check if target is child of source (invalid)
+                if (targetPath.startsWith(srcPath + '/')) return;
+                e.dataTransfer.dropEffect = 'move';
+                row.classList.add('drag-over');
+            };
+
+            row.ondragleave = () => {
+                row.classList.remove('drag-over');
+            };
+
+            row.ondrop = (e) => {
+                e.preventDefault();
+                row.classList.remove('drag-over');
+                const srcPath = e.dataTransfer.getData('text/plain');
+                const targetPath = row.dataset.p;
+                if (!srcPath || srcPath === targetPath) return;
+                if (targetPath.startsWith(srcPath + '/')) return; // Can't drop into own child
+
+                const srcNode = window.__veNodes.get(srcPath);
+                const targetNode = window.__veNodes.get(targetPath);
+                if (srcNode && targetNode) {
+                    console.log('[VE] Drag reparent:', srcPath, '->', targetPath);
+                    reparentNode(srcNode, targetNode);
+                }
+            };
+
+            row.onclick = (e) => {
+                const path = row.dataset.p;
+                const node = window.__veNodes.get(path);
+                if (!node) return;
+
+                if (e.target.classList.contains('tarr')) {
+                    e.stopPropagation();
+                    if (expandedNodes.has(path)) expandedNodes.delete(path);
+                    else expandedNodes.add(path);
+                    renderTree();
+                    return;
+                }
+
+                if (e.target.dataset.a) {
+                    e.stopPropagation();
+                    handleAction(e.target.dataset.a, node);
+                    return;
+                }
+
+                selectNode(node, path);
+            };
+
+            // Double-click to rename
+            row.ondblclick = (e) => {
+                const path = row.dataset.p;
+                const node = window.__veNodes.get(path);
+                if (!node || path === 'stage') return;
+
+                e.stopPropagation();
+                e.preventDefault();
+
+                const lbl = row.querySelector('.tlbl');
+                if (!lbl) return;
+
+                const oldName = node.name || getNodeName(node);
+
+                const input = doc.createElement('input');
+                input.type = 'text';
+                input.value = oldName;
+                input.style.cssText = 'width:100%;background:#1a1a2e;border:1px solid #00BFFF;color:#fff;padding:2px 4px;font:11px system-ui;border-radius:3px;outline:none';
+
+                lbl.textContent = '';
+                lbl.appendChild(input);
+                input.focus();
+                input.select();
+
+                let finished = false;
+                const finish = () => {
+                    if (finished) return;
+                    finished = true;
+                    const newName = input.value.trim() || oldName;
+                    node.name = newName;
+                    if (selectedObject?.pixiNode === node) {
+                        selectedObject.name = newName;
+                        doc.getElementById('pName').textContent = newName;
+                    }
+                    renderTree();
+                    setStatus('✏️ Renamed to ' + newName);
+                };
+
+                input.onblur = finish;
+                input.onkeydown = (ev) => {
+                    if (ev.key === 'Enter') { ev.preventDefault(); finish(); }
+                    if (ev.key === 'Escape') { input.value = oldName; finish(); }
+                };
+            };
+        });
+    }
+
+    function selectNode(node, path) {
+        selectedObject = { name: getNodeName(node), pixiNode: node, path };
+        const doc = editorWindow.document;
+        doc.getElementById('props').classList.add('show');
+        doc.getElementById('pName').textContent = selectedObject.name;
+        updatePropsUI();
+        showAnimationsPanel(node);
+        showSkinsPanel(node);
+        showTextPanel(node);
+        renderTree();
+        updateHighlight();
+    }
+
+    function handleAction(action, node) {
+        switch(action) {
+            case 'vis':
+                node.visible = !node.visible;
+                renderTree();
+                break;
+            case 'dup':
+                duplicateNode(node);
+                break;
+            case 'anim':
+                selectNode(node, selectedObject?.path || 'stage');
+                break;
+        }
+    }
+
+    function showAnimationsPanel(node) {
+        const doc = editorWindow.document;
+        const section = doc.getElementById('animSection');
+        const list = doc.getElementById('animList');
+
+        if (!isSpine(node)) {
+            section.style.display = 'none';
+            return;
+        }
+
+        const anims = getAnimations(node);
+        if (anims.length === 0) {
+            section.style.display = 'none';
+            return;
+        }
+
+        section.style.display = 'block';
+        list.innerHTML = anims.map(a => `<div class="anim-item" data-anim="${a.name}">${a.name}</div>`).join('');
+
+        list.querySelectorAll('.anim-item').forEach(item => {
+            item.onclick = () => {
+                const animName = item.dataset.anim;
+                list.querySelectorAll('.anim-item').forEach(i => i.classList.remove('active'));
+                item.classList.add('active');
+                if (node.state?.setAnimation) {
+                    node.state.setAnimation(0, animName, true);
+                    setStatus('▶ ' + animName);
+                }
+            };
+        });
+    }
+
+    function showSkinsPanel(node) {
+        const doc = editorWindow.document;
+        const section = doc.getElementById('skinSection');
+        const select = doc.getElementById('skinSelect');
+
+        if (!isSpine(node)) {
+            section.style.display = 'none';
+            return;
+        }
+
+        const skins = getSkins(node);
+        if (skins.length <= 1) {
+            section.style.display = 'none';
+            return;
+        }
+
+        section.style.display = 'block';
+        const currentSkin = node.skeleton?.skin?.name || skins[0]?.name || '';
+        select.innerHTML = skins.map(s =>
+            `<option value="${s.name}" ${s.name === currentSkin ? 'selected' : ''}>${s.name}</option>`
+        ).join('');
+    }
+
+    function showTextPanel(node) {
+        const doc = editorWindow.document;
+        const section = doc.getElementById('textSection');
+
+        if (node.text === undefined) {
+            section.style.display = 'none';
+            return;
+        }
+
+        section.style.display = 'block';
+        doc.getElementById('pText').value = node.text || '';
+        doc.getElementById('pFontSize').value = node.style?._fontSize || node.style?.fontSize || 32;
+        doc.getElementById('pFill').value = node.style?._fill || node.style?.fill || '#ffffff';
+        doc.getElementById('pFontFamily').value = node.style?._fontFamily || node.style?.fontFamily || 'Arial';
+    }
+
+    function updatePropsUI() {
+        if (!editorWindow || editorWindow.closed || !selectedObject?.pixiNode) return;
+        const doc = editorWindow.document;
+        const node = selectedObject.pixiNode;
+        doc.getElementById('pX').value = (node.x || 0).toFixed(1);
+        doc.getElementById('pY').value = (node.y || 0).toFixed(1);
+        doc.getElementById('pSX').value = (node.scale?.x || 1).toFixed(3);
+        doc.getElementById('pSY').value = (node.scale?.y || 1).toFixed(3);
+        const alphaEl = doc.getElementById('pA');
+        const rotEl = doc.getElementById('pR');
+        if (alphaEl) alphaEl.value = (node.alpha ?? 1).toFixed(2);
+        if (rotEl) rotEl.value = ((node.rotation || 0) * 180 / Math.PI).toFixed(1);
+
+        // Calculate delta from screen center
+        const deltaEl = doc.getElementById('pDelta');
+        if (deltaEl) {
+            try {
+                const bounds = node.getBounds();
+                const cx = pixiApp.renderer.width / 2;
+                const cy = pixiApp.renderer.height / 2;
+                const nodeCenterX = bounds.x + bounds.width / 2;
+                const nodeCenterY = bounds.y + bounds.height / 2;
+                const dx = Math.round(nodeCenterX - cx);
+                const dy = Math.round(nodeCenterY - cy);
+                deltaEl.textContent = `X: ${dx >= 0 ? '+' : ''}${dx}  Y: ${dy >= 0 ? '+' : ''}${dy}`;
+            } catch (e) {
+                deltaEl.textContent = '-';
+            }
+        }
+        updateRefUI();
+    }
+
+    function copyCode() {
+        if (!selectedObject?.pixiNode) return;
+        const node = selectedObject.pixiNode;
+        const name = selectedObject.name;
+        const varName = name.replace(/[^a-zA-Z0-9]/g, '_');
+        const code = `// ${name}
+this.${varName} = actor;
+actor.x = ${(node.x || 0).toFixed(2)};
+actor.y = ${(node.y || 0).toFixed(2)};
+actor.scale.set(${(node.scale?.x || 1).toFixed(3)}, ${(node.scale?.y || 1).toFixed(3)});`;
+
+        // Try multiple copy methods
+        try {
+            // Method 1: Use main window's clipboard (works better from popup)
+            if (window.opener) {
+                const ta = window.opener.document.createElement('textarea');
+                ta.value = code;
+                ta.style.cssText = 'position:fixed;opacity:0;left:-9999px';
+                window.opener.document.body.appendChild(ta);
+                ta.select();
+                window.opener.document.execCommand('copy');
+                window.opener.document.body.removeChild(ta);
+                setStatus('✅ Code copied!');
+                console.log('[VE] Code copied:\n' + code);
+                return;
+            }
+        } catch (e1) {
+            console.log('[VE] Method 1 failed:', e1.message);
+        }
+
+        try {
+            // Method 2: Use popup's execCommand
+            const doc = editorWindow.document;
+            const ta = doc.createElement('textarea');
+            ta.value = code;
+            ta.style.cssText = 'position:fixed;opacity:0;left:-9999px';
+            doc.body.appendChild(ta);
+            ta.select();
+            doc.execCommand('copy');
+            doc.body.removeChild(ta);
+            setStatus('✅ Code copied!');
+            console.log('[VE] Code copied:\n' + code);
+            return;
+        } catch (e2) {
+            console.log('[VE] Method 2 failed:', e2.message);
+        }
+
+        // Fallback: Show prompt
+        console.log('[VE] Code (copy manually):\n' + code);
+        editorWindow.prompt('Copy this code:', code);
+        setStatus('📋 Copy from prompt');
+    }
+
+    function setStatus(msg) {
+        if (!editorWindow || editorWindow.closed) return;
+        editorWindow.document.getElementById('status').textContent = msg;
+    }
+
+    // ========== Canvas Selection ==========
+    function enableCanvasSelection() {
+        const canvas = document.querySelector('canvas');
+        if (!canvas) return;
+
+        canvas.addEventListener('click', (e) => {
+            const rect = canvas.getBoundingClientRect();
+            const res = pixiApp.renderer?.resolution || 1;
+            const x = (e.clientX - rect.left) * (canvas.width / res) / rect.width;
+            const y = (e.clientY - rect.top) * (canvas.height / res) / rect.height;
+
+            const nodes = [];
+            function collect(node, path) {
+                if (node.worldVisible === false) return;
+                try {
+                    const b = node.getBounds();
+                    if (b && x >= b.x && x <= b.x + b.width && y >= b.y && y <= b.y + b.height) {
+                        const name = getNodeName(node);
+                        if (!isGenericName(name)) {
+                            nodes.push({ node, path, name, area: b.width * b.height });
+                        }
+                    }
+                } catch {}
+                if (node.children) {
+                    node.children.forEach((c, i) => {
+                        collect(c, path + '/' + (c.name || 'c' + i));
+                    });
+                }
+            }
+            collect(pixiApp.stage, 'stage');
+
+            if (nodes.length === 0) return;
+            nodes.sort((a, b) => a.area - b.area);
+
+            const selected = nodes[0];
+            const parts = selected.path.split('/');
+            let acc = '';
+            parts.forEach(p => {
+                acc = acc ? acc + '/' + p : p;
+                expandedNodes.add(acc);
+            });
+
+            if (editorWindow && !editorWindow.closed) {
+                selectNode(selected.node, selected.path);
+            }
+        });
+    }
+
+    // ========== Init ==========
+    window.openVE = function() {
+        if (!detectPIXI()) {
+            console.log('[VE] PIXI not ready; press Alt+V after the game finishes loading.');
+            return;
+        }
+        createEditorWindow();
+        enableCanvasSelection();
+    };
+
+    function handleHotkey(e) {
+        if (!e.altKey) return;
+        const key = e.key?.toLowerCase();
+        if (key !== 'v') return;
+        if (e.repeat) return;
+        const tag = (e.target?.tagName || '').toLowerCase();
+        if (['input', 'textarea', 'select'].includes(tag)) return;
+        e.preventDefault();
+        window.openVE();
+    }
+
+    window.addEventListener('keydown', handleHotkey, true);
+
+    setInterval(() => {
+        if (selectedObject) updateHighlight();
+    }, 100);
+
+    console.log('[VE] ✅ v3 loaded! Press Alt+V to open visual editor.');
+})();
