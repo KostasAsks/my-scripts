@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Zeus V3 Flow Tracer Pro
 // @namespace    http://tampermonkey.net/
-// @version      16.0
-// @description  Beautiful flow tracer with tree view - Alt+6
+// @version      17.0
+// @description  Beautiful flow tracer with tree view, grid UI & visibility tracking - Alt+6
 // @author       Debug Helper
 // @match        http://localhost:*/*
 // @match        https://localhost:*/*
@@ -31,6 +31,8 @@
         let currentView = 'actors';
         let expandedFolders = new Set(['actors']); // Track expanded folders
         const MAX_FLOW = 100;
+        let cachedReelBounds = null;
+        let reelBoundsCacheTime = 0;
 
         const actorColors = {
             'game-scene': '#FF6B6B',
@@ -66,6 +68,119 @@
                 if (match) { detectedGameName = match[1]; return detectedGameName; }
             }
             return 'game';
+        }
+
+        function getPixiApp() {
+            if (pixiApp) return pixiApp;
+            if (window.__PIXI_APP__) { pixiApp = window.__PIXI_APP__; return pixiApp; }
+            if (window.ZeusPlay?.pixiApp) { pixiApp = window.ZeusPlay.pixiApp; return pixiApp; }
+            for (const key of Object.keys(window)) {
+                const val = window[key];
+                if (val && val.stage && val.renderer && typeof val.render === 'function') {
+                    pixiApp = val; return pixiApp;
+                }
+            }
+            return null;
+        }
+
+        function findActorInRegistry(name) {
+            const registry = window.ZeusPlay?.actors?.actorsRegistry;
+            if (!registry) return null;
+            const match = name.match(/^([^\\[]+)(\\[(\\d+)\\])?$/);
+            if (!match) return null;
+            const baseName = match[1], index = match[3] !== undefined ? parseInt(match[3]) : 0;
+            const store = registry.get(baseName);
+            if (!store) return null;
+            return (store._actors || store.actors || [])[index] || null;
+        }
+
+        function findParentCellLabel(actor) {
+            if (!actor) return null;
+            let current = actor.graphicContainer?.graphic || actor, depth = 0;
+            while (current && depth < 20) {
+                const label = current.label || current.name || '';
+                if (/^Cell-\\d+-\\d+-\\d+$/i.test(label)) return label;
+                current = current.parent; depth++;
+            }
+            return null;
+        }
+
+        function getReelAreaBounds() {
+            const now = Date.now();
+            if (cachedReelBounds && now - reelBoundsCacheTime < 500) return cachedReelBounds;
+            const app = getPixiApp();
+            if (!app?.stage) return null;
+            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+            function findVisibleCells(node) {
+                if (!node.worldVisible) return;
+                const label = node.label || node.name || '';
+                if (/^Cell-\\d+-\\d+-\\d+$/i.test(label)) {
+                    try {
+                        const bounds = node.getBounds();
+                        if (bounds && bounds.width > 0) {
+                            minX = Math.min(minX, bounds.x); minY = Math.min(minY, bounds.y);
+                            maxX = Math.max(maxX, bounds.x + bounds.width); maxY = Math.max(maxY, bounds.y + bounds.height);
+                        }
+                    } catch (e) {}
+                }
+                if (node.children) for (const child of node.children) findVisibleCells(child);
+            }
+            findVisibleCells(app.stage);
+            if (minX === Infinity) return null;
+            cachedReelBounds = { x: minX - 20, y: minY - 20, right: maxX + 20, bottom: maxY + 20 };
+            reelBoundsCacheTime = now;
+            return cachedReelBounds;
+        }
+
+        function getActorBounds(actor) {
+            const obj = actor?.graphicContainer?.graphic || actor;
+            if (!obj || typeof obj.getBounds !== 'function') return null;
+            try { const b = obj.getBounds(); if (b && (b.width > 0 || b.height > 0)) return b; } catch (e) {}
+            return null;
+        }
+
+        function isInReelArea(bounds) {
+            const rb = getReelAreaBounds();
+            if (!rb || !bounds) return false;
+            const cx = bounds.x + bounds.width / 2, cy = bounds.y + bounds.height / 2;
+            return cx >= rb.x && cx <= rb.right && cy >= rb.y && cy <= rb.bottom;
+        }
+
+        function getActorVisibilityInfo(name) {
+            const actor = findActorInRegistry(name);
+            if (!actor) return { found: false, onScreen: false, parentCell: null };
+            const obj = actor.graphicContainer?.graphic || actor;
+            if (!obj) return { found: true, onScreen: false, parentCell: null };
+            const worldVisible = obj.worldVisible ?? obj.visible ?? true;
+            if (!worldVisible) return { found: true, onScreen: false, parentCell: null };
+            const bounds = getActorBounds(actor);
+            let parentCell = findParentCellLabel(actor);
+            return { found: true, onScreen: bounds ? isInReelArea(bounds) : false, parentCell };
+        }
+
+        function parseCellLabel(cellLabel) {
+            if (!cellLabel) return { mg: 999, reel: 999, cell: 999 };
+            const m = cellLabel.match(/^Cell-(\\d+)-(\\d+)-(\\d+)$/i);
+            return m ? { mg: parseInt(m[1]), reel: parseInt(m[2]), cell: parseInt(m[3]) } : { mg: 999, reel: 999, cell: 999 };
+        }
+
+        function getSymbolDisplayName(name) {
+            // sym:08[2] -> sym:08, scatter:201[0] -> scatter:201, wild[1] -> wild
+            return name.replace(/\\[\\d+\\]$/, '');
+        }
+
+        function smartSortByCell(a, b) {
+            const ca = parseCellLabel(a.parentCell), cb = parseCellLabel(b.parentCell);
+            if (ca.mg !== cb.mg) return ca.mg - cb.mg;
+            if (ca.reel !== cb.reel) return ca.reel - cb.reel;
+            if (ca.cell !== cb.cell) return ca.cell - cb.cell;
+            return a.name.localeCompare(b.name, undefined, { numeric: true });
+        }
+
+        function smartSortGeneric(a, b) {
+            const parse = (n) => { const m = n.match(/^(.+?)\\[(\\d+)\\]$/); return m ? { base: m[1], idx: parseInt(m[2]) } : { base: n, idx: 0 }; };
+            const pa = parse(a.name), pb = parse(b.name);
+            return pa.base === pb.base ? pa.idx - pb.idx : pa.base.localeCompare(pb.base, undefined, { numeric: true });
         }
 
         // Build tree structure from actors
@@ -116,12 +231,15 @@
                     };
                 }
 
-                // Add actor to folder
+                // Add actor to folder with visibility info
+                const visInfo = getActorVisibilityInfo(actorName);
                 tree.children[folder].actors.push({
                     name: actorName,
                     displayName: cleanName,
                     data: data,
-                    color: getActorColor(cleanName)
+                    color: getActorColor(cleanName),
+                    onScreen: visInfo.onScreen,
+                    parentCell: visInfo.parentCell
                 });
             });
 
@@ -248,12 +366,7 @@
             return Math.floor(diff / 3600000) + 'h';
         }
 
-        function findPixiApp() {
-            if (pixiApp) return pixiApp;
-            const canvas = document.querySelector('canvas');
-            pixiApp = canvas?.__PIXI_APP__ || window.__PIXI_APP__ || window.pixiApp || window.app;
-            return pixiApp;
-        }
+
 
         function createHighlightOverlay() {
             if (highlightOverlay) return highlightOverlay;
@@ -287,7 +400,7 @@
             const data = actorData.get(selectedActor);
             if (!data?.pixiContainer) { clearHighlight(); return; }
             const obj = data.pixiContainer;
-            const app = findPixiApp();
+            const app = getPixiApp();
             if (!obj.parent && obj !== app?.stage) { clearHighlight(); return; }
             try {
                 const bounds = obj.getBounds();
@@ -526,6 +639,19 @@
             color: rgba(255,255,255,0.4);
             margin-left: 8px;
         }
+        .tree-actor-vis {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-left: 6px;
+        }
+        .tree-actor-vis.on {
+            background: #22c55e;
+            box-shadow: 0 0 6px #22c55e60;
+        }
+        .tree-actor-vis.off {
+            background: #6b7280;
+        }
 
         /* ===== RIGHT PANEL ===== */
         .right-panel {
@@ -686,6 +812,103 @@
         .empty { text-align: center; padding: 80px 40px; color: rgba(255,255,255,0.4); }
         .empty-icon { font-size: 64px; margin-bottom: 20px; }
         .empty-title { font-size: 18px; color: rgba(255,255,255,0.7); margin-bottom: 8px; font-weight: 600; }
+
+        /* Grid Layout */
+        .grid-container { margin-bottom: 10px; }
+        .grid-table { display: grid; gap: 3px; background: rgba(0,0,0,0.3); border-radius: 8px; padding: 6px; }
+        .grid-header { font-size: 11px; color: rgba(255,255,255,0.5); text-align: center; padding: 8px 4px; font-weight: 600; background: rgba(255,255,255,0.05); border-radius: 4px; }
+        .grid-cell {
+            background: rgba(255,255,255,0.05);
+            border-radius: 6px;
+            padding: 6px;
+            min-height: 44px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            justify-content: center;
+            align-items: center;
+            transition: all 0.15s;
+        }
+        .grid-cell.has-on { background: rgba(34, 197, 94, 0.1); border: 1px solid rgba(34, 197, 94, 0.3); }
+
+        .actor-chip {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            font-weight: 500;
+            padding: 4px 8px;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: all 0.15s;
+            white-space: nowrap;
+            text-align: center;
+        }
+        .actor-chip.on {
+            background: linear-gradient(135deg, #166534, #14532d);
+            color: #86efac;
+            border: 1px solid #22c55e;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.4);
+        }
+        .actor-chip.off {
+            background: rgba(255,255,255,0.05);
+            color: #6b7280;
+            border: 1px solid rgba(255,255,255,0.1);
+            opacity: 0.5;
+        }
+        .actor-chip:hover {
+            transform: scale(1.05);
+            opacity: 1 !important;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.6);
+        }
+        .actor-chip.highlighted {
+            background: linear-gradient(135deg, #7c3aed, #5b21b6) !important;
+            color: #f3e8ff !important;
+            border-color: #a855f7 !important;
+            opacity: 1 !important;
+            box-shadow: 0 0 12px rgba(168, 85, 247, 0.6);
+        }
+
+        .other-section { margin-top: 12px; padding-top: 12px; border-top: 1px solid rgba(255,255,255,0.1); }
+        .other-title { font-size: 10px; color: rgba(255,255,255,0.4); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.5px; }
+        .other-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+
+        .vis-summary {
+            display: flex;
+            gap: 20px;
+            padding: 10px 14px;
+            background: rgba(0,0,0,0.3);
+            border-radius: 8px;
+            margin-bottom: 14px;
+            font-size: 12px;
+        }
+        .vis-summary-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .vis-summary-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+        }
+        .vis-summary-dot.on {
+            background: #22c55e;
+            box-shadow: 0 0 8px rgba(34, 197, 94, 0.6);
+        }
+        .vis-summary-dot.off {
+            background: #6b7280;
+        }
+        .vis-summary-label {
+            color: rgba(255,255,255,0.6);
+        }
+        .vis-summary-value {
+            font-weight: 700;
+        }
+        .vis-summary-value.on {
+            color: #86efac;
+        }
+        .vis-summary-value.off {
+            color: rgba(255,255,255,0.6);
+        }
     </style>
 </head>
 <body>
@@ -852,6 +1075,7 @@
                     const isRecent = now - actor.data.lastTime < 500;
                     const isSelected = selectedActor === actor.name;
                     const shortAction = formatActionName(actor.data.action);
+                    const visClass = actor.onScreen ? 'on' : 'off';
 
                     html += \`
                         <div class="tree-actor \${isSelected ? 'selected' : ''} \${isRecent ? 'flash' : ''}"
@@ -860,6 +1084,7 @@
                             <span class="tree-actor-name">\${actor.displayName}</span>
                             <span class="tree-actor-action">\${shortAction}</span>
                             <span class="tree-actor-calls">×\${actor.data.totalCalls}</span>
+                            <span class="tree-actor-vis \${visClass}" title="\${actor.onScreen ? 'On Screen' : 'Off Screen'}"></span>
                         </div>
                     \`;
                 });
@@ -946,6 +1171,55 @@
             detailBody.innerHTML = html;
         }
 
+        function renderGridSection(items) {
+            const gridMap = {}, others = [];
+            items.forEach(item => {
+                const cell = parseCellLabel(item.parentCell || item.name);
+                if (cell.reel < 900 && cell.cell < 900) {
+                    const key = cell.reel + '-' + cell.cell;
+                    if (!gridMap[key]) gridMap[key] = [];
+                    gridMap[key].push(item);
+                } else others.push(item);
+            });
+
+            let maxReel = 0, maxCell = 0;
+            Object.keys(gridMap).forEach(k => { const [r, c] = k.split('-').map(Number); maxReel = Math.max(maxReel, r); maxCell = Math.max(maxCell, c); });
+
+            if (maxReel === 0 && maxCell === 0 && Object.keys(gridMap).length === 0) return renderChipList(items);
+
+            const cols = maxReel + 1, rows = maxCell + 1;
+            let html = '<div class="grid-container"><div class="grid-table" style="grid-template-columns: 36px repeat(' + cols + ', 1fr);">';
+            html += '<div class="grid-header"></div>';
+            for (let r = 0; r < cols; r++) html += '<div class="grid-header">R' + r + '</div>';
+            for (let c = 0; c < rows; c++) {
+                html += '<div class="grid-header">C' + c + '</div>';
+                for (let r = 0; r < cols; r++) {
+                    const key = r + '-' + c, cellItems = gridMap[key] || [], hasOn = cellItems.some(i => i.onScreen);
+                    html += '<div class="grid-cell' + (hasOn ? ' has-on' : '') + '">';
+                    cellItems.forEach(item => {
+                        const displayName = getSymbolDisplayName(item.displayName || item.name);
+                        html += '<div class="actor-chip ' + (item.onScreen ? 'on' : 'off') + '" data-actor="' + item.name + '" title="' + item.name + '">' + displayName + '</div>';
+                    });
+                    html += '</div>';
+                }
+            }
+            html += '</div>';
+            if (others.length > 0) {
+                html += '<div class="other-section"><div class="other-title">Other (' + others.length + ')</div><div class="other-chips">';
+                others.forEach(item => { html += '<div class="actor-chip ' + (item.onScreen ? 'on' : 'off') + '" data-actor="' + item.name + '">' + (item.displayName || item.name) + '</div>'; });
+                html += '</div></div>';
+            }
+            html += '</div>';
+            return html;
+        }
+
+        function renderChipList(items) {
+            if (items.length === 0) return '<div style="color:rgba(255,255,255,0.4);text-align:center;padding:12px;font-size:12px;">None</div>';
+            let html = '<div class="other-chips">';
+            items.forEach(item => { html += '<div class="actor-chip ' + (item.onScreen ? 'on' : 'off') + '" data-actor="' + item.name + '">' + (item.displayName || item.name) + '</div>'; });
+            return html + '</div>';
+        }
+
         function renderActorDetails() {
             if (!tracerWindow || tracerWindow.closed || currentView === 'flow') return;
             const doc = tracerWindow.document;
@@ -1000,6 +1274,45 @@
                 \`;
             }).join('');
 
+            // Get related actors (same folder) with visibility info
+            const tree = buildActorTree();
+            let relatedActorsHtml = '';
+            for (const folder of Object.values(tree.children)) {
+                const relatedActor = folder.actors.find(a => a.name === selectedActor);
+                if (relatedActor && folder.actors.length > 1) {
+                    const allRelated = folder.actors.filter(a => a.name !== selectedActor);
+                    cachedReelBounds = null; // Force refresh
+                    const totalOn = allRelated.filter(a => a.onScreen).length;
+                    const totalOff = allRelated.filter(a => !a.onScreen).length;
+                    
+                    relatedActorsHtml = \`
+                        <div class="section">
+                            <div class="section-header"><span><span class="section-icon">🎭</span>Related Actors in \${folder.name}</span></div>
+                            <div class="section-body">
+                                <div class="vis-summary">
+                                    <div class="vis-summary-item">
+                                        <div class="vis-summary-dot on"></div>
+                                        <span class="vis-summary-label">In Area:</span>
+                                        <span class="vis-summary-value on">\${totalOn}</span>
+                                    </div>
+                                    <div class="vis-summary-item">
+                                        <div class="vis-summary-dot off"></div>
+                                        <span class="vis-summary-label">Outside:</span>
+                                        <span class="vis-summary-value off">\${totalOff}</span>
+                                    </div>
+                                    <div class="vis-summary-item">
+                                        <span class="vis-summary-label">Total:</span>
+                                        <span class="vis-summary-value">\${allRelated.length}</span>
+                                    </div>
+                                </div>
+                                \${renderGridSection(allRelated)}
+                            </div>
+                        </div>
+                    \`;
+                    break;
+                }
+            }
+
             body.innerHTML = \`
                 <div class="section">
                     <div class="section-header">
@@ -1010,6 +1323,7 @@
                         \${generatePathTreeHTML(pathInfo)}
                     </div>
                 </div>
+                \${relatedActorsHtml}
                 <div class="section">
                     <div class="section-header"><span><span class="section-icon">🎬</span>Actions</span></div>
                     <div class="section-body" style="padding:12px;">
@@ -1017,6 +1331,22 @@
                     </div>
                 </div>
             \`;
+
+            // Add click handlers for actor chips
+            body.querySelectorAll('[data-actor]').forEach(el => {
+                el.onclick = (e) => {
+                    e.stopPropagation();
+                    const name = el.dataset.actor;
+                    if (selectedActor === name) {
+                        selectedActor = null;
+                    } else {
+                        selectedActor = name;
+                    }
+                    renderTreeView();
+                    renderActorDetails();
+                    updateHighlight();
+                };
+            });
         }
 
         function logAction(actorName, action, params, pixiContainer) {
@@ -1092,7 +1422,7 @@
             }
         });
 
-        console.log('[Flow Tracer v16] ✅ Alt+6');
+        console.log('[Flow Tracer v17] ✅ Alt+6 - With visibility tracking & grid UI');
     })();
     `;
     document.head.appendChild(script);
